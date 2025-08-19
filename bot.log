@@ -11,3 +11,10 @@ Saved and forwarded agent message for ticket 1 from agent 744260641
 Failed to save or forward agent message for ticket 1: NOT NULL constraint failed: agents_agentmessage.customer_id
 Failed to save or forward agent message for ticket 1: NOT NULL constraint failed: agents_agentmessage.customer_id
 Failed to save or forward agent message for ticket 1: NOT NULL constraint failed: agents_agentmessage.customer_id
+Ticket 1 marked as closed by agent 744260641
+Sent closure approval request for ticket 1 to admin 744260641
+Closure approved for ticket 1 by admin 744260641, agent unlinked
+Notified customer 7957663994 of closure approval for ticket 1
+Notified agent 744260641 of closure approval and unlinking for ticket 1
+Ticket 1 permanently closed by admin 744260641
+Notified customer 7957663994 of final closure for ticket 1
