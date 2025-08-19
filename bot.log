@@ -1,0 +1,13 @@
+Sent preview of 3 messages for ticket 1 to agent 744260641
+Ticket 1 claimed by agent 744260641
+Forwarded 3 messages for ticket 1 to agent 744260641
+Saved and forwarded agent message for ticket 1 from agent 744260641
+Saved and forwarded agent message for ticket 1 from agent 744260641
+Saved and forwarded agent message for ticket 1 from agent 744260641
+Failed to save or forward agent message for ticket 1: A request to the Telegram API was unsuccessful. Error code: 400. Description: Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 40
+Failed to save or forward agent message for ticket 1: A request to the Telegram API was unsuccessful. Error code: 400. Description: Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 40
+Saved and forwarded agent message for ticket 1 from agent 744260641
+Saved and forwarded agent message for ticket 1 from agent 744260641
+Failed to save or forward agent message for ticket 1: NOT NULL constraint failed: agents_agentmessage.customer_id
+Failed to save or forward agent message for ticket 1: NOT NULL constraint failed: agents_agentmessage.customer_id
+Failed to save or forward agent message for ticket 1: NOT NULL constraint failed: agents_agentmessage.customer_id

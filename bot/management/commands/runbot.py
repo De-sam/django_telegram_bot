@@ -19,9 +19,9 @@ class Command(BaseCommand):
     def handle(self, *args, **kwargs):
         self.stdout.write("Starting bot polling...")
 
+        register_ticket_handlers(bot)
         register_agent_handlers(bot)
         register_customer_handlers(bot)
-        register_ticket_handlers()
         
 
         bot.polling(none_stop=True)
