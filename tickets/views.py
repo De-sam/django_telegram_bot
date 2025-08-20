@@ -3,6 +3,7 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.utils import timezone
 from tickets.models import Ticket
 from agents.models import Agent
+from customers.models import Customer
 from admin_app.models import AdminDecision
 import logging
 
@@ -39,6 +40,13 @@ def claim_ticket(ticket_id: int, telegram_id: int):
     with transaction.atomic():
         ticket.agent = agent
         ticket.is_claimed = True
+        ticket.is_resolved = False
+        ticket.is_closed = False
+        ticket.is_resolved_approved = False
+        ticket.is_closed_approved = False
+        ticket.customer.open_ticket = True
+        ticket.customer.open_ticket_spam = 0
+        ticket.customer.save()
         ticket.save()
 
     logger.info(f"Ticket {ticket_id} claimed by agent {telegram_id}")
@@ -132,8 +140,12 @@ def approve_ticket_resolution(ticket_id: int, telegram_id: int):
 
     with transaction.atomic():
         ticket.is_resolved_approved = True
+        ticket.is_closed = False  # Ensure ticket is not closed
         ticket.is_claimed = False  # Unlink agent
         ticket.agent = None  # Clear agent assignment
+        ticket.customer.open_ticket = True  # Allow customer messages
+        ticket.customer.open_ticket_spam = 0  # Reset spam counter
+        ticket.customer.save()
         ticket.save()
 
         AdminDecision.objects.create(
@@ -147,7 +159,7 @@ def approve_ticket_resolution(ticket_id: int, telegram_id: int):
     return {
         "status": "success",
         "message": "Ticket resolution has been approved and agent unlinked.",
-        "agent_telegram_id": agent_telegram_id  # Return agent ID for notifications
+        "agent_telegram_id": agent_telegram_id
     }
 
 def decline_ticket_resolution(ticket_id: int, telegram_id: int):
@@ -169,6 +181,8 @@ def decline_ticket_resolution(ticket_id: int, telegram_id: int):
     with transaction.atomic():
         ticket.is_resolved = False
         ticket.is_resolved_approved = False
+        ticket.resolution_summary = None
+        ticket.resolved_at = None
         ticket.save()
 
         AdminDecision.objects.create(
@@ -207,8 +221,12 @@ def approve_ticket_closure(ticket_id: int, telegram_id: int):
 
     with transaction.atomic():
         ticket.is_closed_approved = True
+        ticket.is_closed = False  # Ensure ticket is not closed
         ticket.is_claimed = False  # Unlink agent
         ticket.agent = None  # Clear agent assignment
+        ticket.customer.open_ticket = True  # Allow customer messages
+        ticket.customer.open_ticket_spam = 0  # Reset spam counter
+        ticket.customer.save()
         ticket.save()
 
         AdminDecision.objects.create(
@@ -222,7 +240,7 @@ def approve_ticket_closure(ticket_id: int, telegram_id: int):
     return {
         "status": "success",
         "message": "Ticket closure has been approved and agent unlinked.",
-        "agent_telegram_id": agent_telegram_id  # Return agent ID for notifications
+        "agent_telegram_id": agent_telegram_id
     }
 
 def decline_ticket_closure(ticket_id: int, telegram_id: int):
@@ -244,6 +262,8 @@ def decline_ticket_closure(ticket_id: int, telegram_id: int):
     with transaction.atomic():
         ticket.is_closed = False
         ticket.is_closed_approved = False
+        ticket.closure_summary = None
+        ticket.closed_at = None
         ticket.save()
 
         AdminDecision.objects.create(
@@ -267,18 +287,23 @@ def raise_ticket(ticket_id: int):
         logger.error(f"Ticket {ticket_id} not found for raising")
         return {"status": "error", "message": "Ticket not found."}
 
-    if not ticket.is_closed_approved:
-        logger.warning(f"Ticket {ticket_id} not approved for closure, cannot raise")
-        return {"status": "error", "message": "This ticket's closure has not been approved."}
+    if not (ticket.is_closed_approved or ticket.is_resolved_approved):
+        logger.warning(f"Ticket {ticket_id} neither closed nor resolved approved, cannot raise")
+        return {"status": "error", "message": "This ticket's closure or resolution has not been approved."}
 
     with transaction.atomic():
         ticket.is_closed = False
         ticket.is_closed_approved = False
+        ticket.is_resolved = False
+        ticket.is_resolved_approved = False
         ticket.is_claimed = False
         ticket.agent = None
+        ticket.customer.open_ticket = True
+        ticket.customer.open_ticket_spam = 0
+        ticket.customer.save()
         ticket.save()
 
-    logger.info(f"Ticket {ticket_id} raised back to support group")
+    logger.info(f"Ticket {ticket_id} raised back to support group, reset open_ticket_spam for customer {ticket.customer.telegram_id}")
     return {"status": "success", "message": "Ticket raised back to support group."}
 
 def handle_ticket(ticket_id: int, telegram_id: int):
@@ -294,15 +319,20 @@ def handle_ticket(ticket_id: int, telegram_id: int):
         logger.error(f"Ticket {ticket_id} not found for handling")
         return {"status": "error", "message": "Ticket not found."}
 
-    if not ticket.is_closed_approved:
-        logger.warning(f"Ticket {ticket_id} not approved for closure, cannot handle")
-        return {"status": "error", "message": "This ticket's closure has not been approved."}
+    if not (ticket.is_closed_approved or ticket.is_resolved_approved):
+        logger.warning(f"Ticket {ticket_id} neither closed nor resolved approved, cannot handle")
+        return {"status": "error", "message": "This ticket's closure or resolution has not been approved."}
 
     with transaction.atomic():
         ticket.agent = admin
         ticket.is_claimed = True
         ticket.is_closed = False
         ticket.is_closed_approved = False
+        ticket.is_resolved = False
+        ticket.is_resolved_approved = False
+        ticket.customer.open_ticket = True
+        ticket.customer.open_ticket_spam = 0
+        ticket.customer.save()
         ticket.save()
 
     logger.info(f"Ticket {ticket_id} assigned to admin {telegram_id} for handling")
@@ -315,9 +345,9 @@ def close_ticket_finally(ticket_id: int, telegram_id: int):
         logger.error(f"Ticket {ticket_id} not found for final closure")
         return {"status": "error", "message": "Ticket not found."}
 
-    if not ticket.is_closed_approved:
-        logger.warning(f"Ticket {ticket_id} not approved for closure, cannot close finally")
-        return {"status": "error", "message": "This ticket's closure has not been approved."}
+    if not (ticket.is_closed_approved or ticket.is_resolved_approved):
+        logger.warning(f"Ticket {ticket_id} neither closed nor resolved approved, cannot close finally")
+        return {"status": "error", "message": "This ticket's closure or resolution has not been approved."}
 
     try:
         admin = Agent.objects.get(telegram_id=telegram_id)
@@ -325,14 +355,19 @@ def close_ticket_finally(ticket_id: int, telegram_id: int):
         logger.error(f"Admin (Agent) not found for telegram_id {telegram_id}")
         return {"status": "error", "message": "Admin not found or not registered as agent."}
 
-    # Store agent Telegram ID for notifications (if any agent was assigned)
+    # Store agent Telegram ID for notifications
     agent_telegram_id = ticket.agent.telegram_id if ticket.agent else None
 
     with transaction.atomic():
         ticket.is_closed = True
         ticket.is_closed_approved = True
+        ticket.is_resolved = True
+        ticket.is_resolved_approved = True
         ticket.is_claimed = False
         ticket.agent = None
+        ticket.closed_at = timezone.now()
+        ticket.customer.open_ticket = False
+        ticket.customer.save()
         ticket.save()
 
         AdminDecision.objects.create(

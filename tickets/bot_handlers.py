@@ -59,6 +59,7 @@ def register_ticket_handlers(bot):
         result = resolve_ticket(ticket_id, agent_tid, summary)
         if result["status"] != "success":
             bot.reply_to(msg, f"❌ {result['message']}")
+            logger.error(f"Failed to resolve ticket {ticket_id}: {result['message']}")
             return
 
         ticket = Ticket.objects.get(id=ticket_id)
@@ -73,7 +74,7 @@ def register_ticket_handlers(bot):
             try:
                 bot.send_message(
                     admin_id,
-                    f"📩 Ticket #{ticket.id} resolved by Agent {ticket.agent.full_name}.\n\n"
+                    f"📩 Ticket #{ticket.id} resolved by Agent {ticket.agent.full_name or ticket.agent.telegram_id}.\n\n"
                     f"📝 Summary:\n{sanitize_text(ticket.resolution_summary or '')}\n\n"
                     "Approve or decline:",
                     reply_markup=markup
@@ -107,6 +108,7 @@ def register_ticket_handlers(bot):
         result = close_ticket(ticket_id, agent_tid, summary)
         if result["status"] != "success":
             bot.reply_to(msg, f"❌ {result['message']}")
+            logger.error(f"Failed to close ticket {ticket_id}: {result['message']}")
             return
 
         ticket = Ticket.objects.get(id=ticket_id)
@@ -121,7 +123,7 @@ def register_ticket_handlers(bot):
             try:
                 bot.send_message(
                     admin_id,
-                    f"📩 Ticket #{ticket.id} closed by Agent {ticket.agent.full_name}.\n\n"
+                    f"📩 Ticket #{ticket.id} closed by Agent {ticket.agent.full_name or ticket.agent.telegram_id}.\n\n"
                     f"📝 Summary:\n{sanitize_text(ticket.closure_summary or '')}\n\n"
                     "Approve or decline:",
                     reply_markup=markup
@@ -168,6 +170,7 @@ def register_ticket_handlers(bot):
         result = claim_ticket(ticket_id, user_id)
         if result["status"] != "success":
             bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
+            logger.error(f"Failed to claim ticket {ticket_id}: {result['message']}")
             return
 
         ticket = result["ticket"]
@@ -180,7 +183,7 @@ def register_ticket_handlers(bot):
             pass
         try:
             bot.edit_message_text(
-                f"📩 Ticket #{ticket.id} claimed by Agent {agent.full_name} (ID:{agent.id:03d})\n\n{call.message.text}",
+                f"📩 Ticket #{ticket.id} claimed by Agent {agent.full_name or agent.telegram_id} (ID:{agent.id:03d})\n\n{call.message.text}",
                 call.message.chat.id,
                 call.message.message_id
             )
@@ -269,277 +272,294 @@ def register_ticket_handlers(bot):
     def cb_approve_resolved(call: CallbackQuery):
         ticket_id = int(call.data.split("_")[2])
         result = approve_ticket_resolution(ticket_id, call.from_user.id)
-        if result["status"] == "success":
-            try:
-                ticket = Ticket.objects.get(id=ticket_id)
-                agent_telegram_id = result.get("agent_telegram_id")
-                # Notify customer
+        if result["status"] != "success":
+            bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
+            logger.error(f"Failed to approve resolution for ticket {ticket_id}: {result['message']}")
+            return
+
+        try:
+            ticket = Ticket.objects.get(id=ticket_id)
+            agent_telegram_id = result.get("agent_telegram_id")
+            # Notify customer
+            bot.send_message(
+                ticket.customer.telegram_id,
+                f"🎉 Your Ticket #{ticket.id} has been resolved.\nSummary: {sanitize_text(ticket.resolution_summary or 'No summary provided')}\n\n"
+                f"This ticket is now closed, but can be reopened if you send further messages.",
+                parse_mode="Markdown"
+            )
+            logger.info(f"Notified customer {ticket.customer.telegram_id} of resolution approval for ticket {ticket_id}")
+            # Notify agent if available
+            if agent_telegram_id:
                 bot.send_message(
-                    ticket.customer.telegram_id,
-                    f"🎉 Your Ticket #{ticket.id} has been resolved.\nSummary: {sanitize_text(ticket.resolution_summary)}\n\n"
-                    f"This ticket is now closed, and a new agent will assist if you send further messages.",
+                    agent_telegram_id,
+                    f"✅ Your resolution for Ticket #{ticket.id} has been approved by an admin.\nSummary: {sanitize_text(ticket.resolution_summary or 'No summary provided')}\n\n"
+                    f"You are no longer assigned to this ticket.",
                     parse_mode="Markdown"
                 )
-                logger.info(f"Notified customer {ticket.customer.telegram_id} of resolution approval for ticket {ticket_id}")
-                # Notify agent if available
-                if agent_telegram_id:
-                    bot.send_message(
-                        agent_telegram_id,
-                        f"✅ Your resolution for Ticket #{ticket.id} has been approved by an admin.\nSummary: {sanitize_text(ticket.resolution_summary)}\n\n"
-                        f"You are no longer assigned to this ticket.",
-                        parse_mode="Markdown"
-                    )
-                    logger.info(f"Notified agent {agent_telegram_id} of resolution approval and unlinking for ticket {ticket_id}")
-                else:
-                    logger.warning(f"No agent Telegram ID available for resolution approval notification of ticket {ticket_id}")
-                # Update admin message
-                bot.edit_message_text(
-                    f"✅ Ticket #{ticket.id} resolution approved by admin. Agent unlinked.",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=None
-                )
-                bot.answer_callback_query(call.id, "✅ Resolution approved.")
-            except Exception as e:
-                logger.error(f"Failed to notify for resolution approval of ticket {ticket_id}: {e}")
-                bot.answer_callback_query(call.id, f"✅ Resolution approved, but notification failed: {str(e)}", show_alert=True)
-        else:
-            bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
-            logger.error(f"Resolution approval failed for ticket {ticket_id}: {result['message']}")
+                logger.info(f"Notified agent {agent_telegram_id} of resolution approval and unlinking for ticket {ticket_id}")
+            else:
+                logger.warning(f"No agent Telegram ID available for resolution approval notification of ticket {ticket_id}")
+            # Update admin message with action buttons
+            new_markup = InlineKeyboardMarkup()
+            new_markup.add(
+                InlineKeyboardButton("📬 Raise Ticket", callback_data=f"raise_ticket_{ticket.id}"),
+                InlineKeyboardButton("🤝 Handle Ticket", callback_data=f"handle_ticket_{ticket.id}"),
+                InlineKeyboardButton("🔒 Close Ticket Finally", callback_data=f"close_finally_{ticket.id}")
+            )
+            bot.edit_message_text(
+                f"✅ Ticket #{ticket.id} resolution approved by admin. Agent unlinked.\n\nChoose next action:",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=new_markup
+            )
+            bot.answer_callback_query(call.id, "✅ Resolution approved. Choose next action.")
+        except Exception as e:
+            logger.error(f"Failed to notify or update for resolution approval of ticket {ticket_id}: {e}")
+            bot.answer_callback_query(call.id, f"✅ Resolution approved, but notification failed: {str(e)}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("decline_resolved_"))
     def cb_decline_resolved(call: CallbackQuery):
         ticket_id = int(call.data.split("_")[2])
         result = decline_ticket_resolution(ticket_id, call.from_user.id)
-        if result["status"] == "success":
-            try:
-                ticket = Ticket.objects.get(id=ticket_id)
-                # Notify customer
+        if result["status"] != "success":
+            bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
+            logger.error(f"Failed to decline resolution for ticket {ticket_id}: {result['message']}")
+            return
+
+        try:
+            ticket = Ticket.objects.get(id=ticket_id)
+            agent_telegram_id = result.get("agent_telegram_id")
+            # Notify customer
+            bot.send_message(
+                ticket.customer.telegram_id,
+                f"📩 Your Ticket #{ticket.id} resolution was declined by an admin. The assigned agent will continue assisting you.",
+                parse_mode="Markdown"
+            )
+            logger.info(f"Notified customer {ticket.customer.telegram_id} of resolution decline for ticket {ticket_id}")
+            # Notify agent if available
+            if agent_telegram_id:
                 bot.send_message(
-                    ticket.customer.telegram_id,
-                    f"📩 Your Ticket #{ticket.id} resolution was declined by an admin. The assigned agent will continue assisting you.",
-                    parse_mode="Markdown"
-                )
-                logger.info(f"Notified customer {ticket.customer.telegram_id} of resolution decline for ticket {ticket_id}")
-                # Notify agent
-                bot.send_message(
-                    ticket.agent.telegram_id,
+                    agent_telegram_id,
                     f"❌ Your resolution for Ticket #{ticket.id} was declined by an admin. Please review and resubmit or continue assisting.",
                     parse_mode="Markdown"
                 )
-                logger.info(f"Notified agent {ticket.agent.telegram_id} of resolution decline for ticket {ticket_id}")
-                # Update admin message
-                bot.edit_message_text(
-                    f"❌ Ticket #{ticket.id} resolution declined by admin.",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=None
-                )
-                bot.answer_callback_query(call.id, "✅ Resolution declined.")
-            except Exception as e:
-                logger.error(f"Failed to notify for resolution decline of ticket {ticket_id}: {e}")
-                bot.answer_callback_query(call.id, f"✅ Resolution declined, but notification failed: {str(e)}", show_alert=True)
-        else:
-            bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
-            logger.error(f"Resolution decline failed for ticket {ticket_id}: {result['message']}")
+                logger.info(f"Notified agent {agent_telegram_id} of resolution decline for ticket {ticket_id}")
+            # Update admin message
+            bot.edit_message_text(
+                f"❌ Ticket #{ticket.id} resolution declined by admin.",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None
+            )
+            bot.answer_callback_query(call.id, "✅ Resolution declined.")
+        except Exception as e:
+            logger.error(f"Failed to notify for resolution decline of ticket {ticket_id}: {e}")
+            bot.answer_callback_query(call.id, f"✅ Resolution declined, but notification failed: {str(e)}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_closed_"))
     def cb_approve_closed(call: CallbackQuery):
         ticket_id = int(call.data.split("_")[2])
         result = approve_ticket_closure(ticket_id, call.from_user.id)
-        if result["status"] == "success":
-            try:
-                ticket = Ticket.objects.get(id=ticket_id)
-                agent_telegram_id = result.get("agent_telegram_id")
-                # Notify customer of approval (initial closure)
+        if result["status"] != "success":
+            bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
+            logger.error(f"Failed to approve closure for ticket {ticket_id}: {result['message']}")
+            return
+
+        try:
+            ticket = Ticket.objects.get(id=ticket_id)
+            agent_telegram_id = result.get("agent_telegram_id")
+            # Notify customer
+            bot.send_message(
+                ticket.customer.telegram_id,
+                f"✅ Your Ticket #{ticket.id} has been closed.\nSummary: {sanitize_text(ticket.closure_summary or 'No summary provided')}\n\n"
+                f"This ticket is now closed, but can be reopened if you send further messages.",
+                parse_mode="Markdown"
+            )
+            logger.info(f"Notified customer {ticket.customer.telegram_id} of closure approval for ticket {ticket_id}")
+            # Notify agent if available
+            if agent_telegram_id:
                 bot.send_message(
-                    ticket.customer.telegram_id,
-                    f"✅ Your Ticket #{ticket.id} has been closed.\nSummary: {sanitize_text(ticket.closure_summary)}\n\n"
-                    f"This ticket is now closed, and a new agent will assist if you send further messages.",
+                    agent_telegram_id,
+                    f"✅ Your closure for Ticket #{ticket.id} has been approved by an admin.\nSummary: {sanitize_text(ticket.closure_summary or 'No summary provided')}\n\n"
+                    f"You are no longer assigned to this ticket.",
                     parse_mode="Markdown"
                 )
-                logger.info(f"Notified customer {ticket.customer.telegram_id} of closure approval for ticket {ticket_id}")
-                # Notify agent if available
-                if agent_telegram_id:
-                    bot.send_message(
-                        agent_telegram_id,
-                        f"✅ Your closure for Ticket #{ticket.id} has been approved by an admin.\nSummary: {sanitize_text(ticket.closure_summary)}\n\n"
-                        f"You are no longer assigned to this ticket.",
-                        parse_mode="Markdown"
-                    )
-                    logger.info(f"Notified agent {agent_telegram_id} of closure approval and unlinking for ticket {ticket_id}")
-                else:
-                    logger.warning(f"No agent Telegram ID available for closure approval notification of ticket {ticket_id}")
-                # Update admin message with new options
-                new_markup = InlineKeyboardMarkup()
-                new_markup.add(
-                    InlineKeyboardButton("📬 Raise Ticket", callback_data=f"raise_ticket_{ticket.id}"),
-                    InlineKeyboardButton("🤝 Handle Ticket", callback_data=f"handle_ticket_{ticket.id}"),
-                    InlineKeyboardButton("🔒 Close Ticket Finally", callback_data=f"close_finally_{ticket.id}")
-                )
-                bot.edit_message_text(
-                    f"✅ Ticket #{ticket.id} closure approved by admin. Agent unlinked.\n\nChoose next action:",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=new_markup
-                )
-                bot.answer_callback_query(call.id, "✅ Closure approved. Choose next action.")
-            except Exception as e:
-                logger.error(f"Failed to notify or update for closure approval of ticket {ticket_id}: {e}")
-                bot.answer_callback_query(call.id, f"✅ Closure approved, but notification failed: {str(e)}", show_alert=True)
-        else:
-            bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
-            logger.error(f"Closure approval failed for ticket {ticket_id}: {result['message']}")
+                logger.info(f"Notified agent {agent_telegram_id} of closure approval and unlinking for ticket {ticket_id}")
+            else:
+                logger.warning(f"No agent Telegram ID available for closure approval notification of ticket {ticket_id}")
+            # Update admin message with new options
+            new_markup = InlineKeyboardMarkup()
+            new_markup.add(
+                InlineKeyboardButton("📬 Raise Ticket", callback_data=f"raise_ticket_{ticket.id}"),
+                InlineKeyboardButton("🤝 Handle Ticket", callback_data=f"handle_ticket_{ticket.id}"),
+                InlineKeyboardButton("🔒 Close Ticket Finally", callback_data=f"close_finally_{ticket.id}")
+            )
+            bot.edit_message_text(
+                f"✅ Ticket #{ticket.id} closure approved by admin. Agent unlinked.\n\nChoose next action:",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=new_markup
+            )
+            bot.answer_callback_query(call.id, "✅ Closure approved. Choose next action.")
+        except Exception as e:
+            logger.error(f"Failed to notify or update for closure approval of ticket {ticket_id}: {e}")
+            bot.answer_callback_query(call.id, f"✅ Closure approved, but notification failed: {str(e)}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("decline_closed_"))
     def cb_decline_closed(call: CallbackQuery):
         ticket_id = int(call.data.split("_")[2])
         result = decline_ticket_closure(ticket_id, call.from_user.id)
-        if result["status"] == "success":
-            try:
-                ticket = Ticket.objects.get(id=ticket_id)
-                # Notify customer
+        if result["status"] != "success":
+            bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
+            logger.error(f"Failed to decline closure for ticket {ticket_id}: {result['message']}")
+            return
+
+        try:
+            ticket = Ticket.objects.get(id=ticket_id)
+            agent_telegram_id = result.get("agent_telegram_id")
+            # Notify customer
+            bot.send_message(
+                ticket.customer.telegram_id,
+                f"📩 Your Ticket #{ticket.id} closure was declined by an admin. The assigned agent will continue assisting you.",
+                parse_mode="Markdown"
+            )
+            logger.info(f"Notified customer {ticket.customer.telegram_id} of closure decline for ticket {ticket_id}")
+            # Notify agent if available
+            if agent_telegram_id:
                 bot.send_message(
-                    ticket.customer.telegram_id,
-                    f"📩 Your Ticket #{ticket.id} closure was declined by an admin. The assigned agent will continue assisting you.",
-                    parse_mode="Markdown"
-                )
-                logger.info(f"Notified customer {ticket.customer.telegram_id} of closure decline for ticket {ticket_id}")
-                # Notify agent
-                bot.send_message(
-                    ticket.agent.telegram_id,
+                    agent_telegram_id,
                     f"❌ Your closure for Ticket #{ticket.id} was declined by an admin. Please review and resubmit or continue assisting.",
                     parse_mode="Markdown"
                 )
-                logger.info(f"Notified agent {ticket.agent.telegram_id} of closure decline for ticket {ticket_id}")
-                # Update admin message
-                bot.edit_message_text(
-                    f"❌ Ticket #{ticket.id} closure declined by admin.",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=None
-                )
-                bot.answer_callback_query(call.id, "✅ Closure declined.")
-            except Exception as e:
-                logger.error(f"Failed to notify for closure decline of ticket {ticket_id}: {e}")
-                bot.answer_callback_query(call.id, f"✅ Closure declined, but notification failed: {str(e)}", show_alert=True)
-        else:
-            bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
-            logger.error(f"Closure decline failed for ticket {ticket_id}: {result['message']}")
+                logger.info(f"Notified agent {agent_telegram_id} of closure decline for ticket {ticket_id}")
+            # Update admin message
+            bot.edit_message_text(
+                f"❌ Ticket #{ticket.id} closure declined by admin.",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None
+            )
+            bot.answer_callback_query(call.id, "✅ Closure declined.")
+        except Exception as e:
+            logger.error(f"Failed to notify for closure decline of ticket {ticket_id}: {e}")
+            bot.answer_callback_query(call.id, f"✅ Closure declined, but notification failed: {str(e)}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("raise_ticket_"))
     def cb_raise_ticket(call: CallbackQuery):
         ticket_id = int(call.data.split("_")[2])
         result = raise_ticket(ticket_id)
-        if result["status"] == "success":
-            try:
-                ticket = Ticket.objects.get(id=ticket_id)
-                # Notify customer
-                bot.send_message(
-                    ticket.customer.telegram_id,
-                    f"📩 Your Ticket #{ticket.id} has been reopened and will be reassigned to a new agent.",
-                    parse_mode="Markdown"
-                )
-                logger.info(f"Notified customer {ticket.customer.telegram_id} of ticket raise for {ticket_id}")
-                # Post to support group
-                markup = InlineKeyboardMarkup()
-                markup.add(
-                    InlineKeyboardButton("🎫 Claim Ticket", callback_data=f"claim_{ticket.id}"),
-                    InlineKeyboardButton("👀 Preview Messages", callback_data=f"preview_{ticket.id}")
-                )
-                bot.send_message(
-                    settings.SUPPORT_CHAT,
-                    f"📩 Ticket #{ticket.id} reopened for re-claim.\n\nSummary: {sanitize_text(ticket.closure_summary)}",
-                    reply_markup=markup
-                )
-                logger.info(f"Posted reopened ticket {ticket_id} to support group")
-                # Update admin message
-                bot.edit_message_text(
-                    f"✅ Ticket #{ticket.id} raised back to support group.",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=None
-                )
-                bot.answer_callback_query(call.id, "✅ Ticket raised.")
-            except Exception as e:
-                logger.error(f"Failed to notify or post for raise of ticket {ticket_id}: {e}")
-                bot.answer_callback_query(call.id, f"✅ Ticket raised, but notification failed: {str(e)}", show_alert=True)
-        else:
+        if result["status"] != "success":
             bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
-            logger.error(f"Raise failed for ticket {ticket_id}: {result['message']}")
+            logger.error(f"Failed to raise ticket {ticket_id}: {result['message']}")
+            return
+
+        try:
+            ticket = Ticket.objects.get(id=ticket_id)
+            # Notify customer
+            bot.send_message(
+                ticket.customer.telegram_id,
+                f"📩 Your Ticket #{ticket.id} has been reopened and will be reassigned to a new agent.",
+                parse_mode="Markdown"
+            )
+            logger.info(f"Notified customer {ticket.customer.telegram_id} of ticket raise for {ticket_id}")
+            # Post to support group
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("🎫 Claim Ticket", callback_data=f"claim_{ticket.id}"),
+                InlineKeyboardButton("👀 Preview Messages", callback_data=f"preview_{ticket.id}")
+            )
+            bot.send_message(
+                settings.SUPPORT_CHAT,
+                f"📩 Ticket #{ticket.id} reopened for re-claim.\n\nSummary: {sanitize_text(ticket.resolution_summary or ticket.closure_summary or 'No summary provided')}",
+                reply_markup=markup
+            )
+            logger.info(f"Posted reopened ticket {ticket_id} to support group {settings.SUPPORT_CHAT}")
+            # Update admin message
+            bot.edit_message_text(
+                f"✅ Ticket #{ticket.id} raised back to support group.",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None
+            )
+            bot.answer_callback_query(call.id, "✅ Ticket raised.")
+        except Exception as e:
+            logger.error(f"Failed to notify or post for raise of ticket {ticket_id}: {e}")
+            bot.answer_callback_query(call.id, f"✅ Ticket raised, but notification failed: {str(e)}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("handle_ticket_"))
     def cb_handle_ticket(call: CallbackQuery):
         ticket_id = int(call.data.split("_")[2])
         admin_id = call.from_user.id
         result = handle_ticket(ticket_id, admin_id)
-        if result["status"] == "success":
-            try:
-                ticket = Ticket.objects.get(id=ticket_id)
-                # Notify customer
-                bot.send_message(
-                    ticket.customer.telegram_id,
-                    f"📩 An admin is now handling your Ticket #{ticket.id}.",
-                    parse_mode="Markdown"
-                )
-                logger.info(f"Notified customer {ticket.customer.telegram_id} of admin handling for ticket {ticket_id}")
-                # Notify admin
-                bot.send_message(
-                    admin_id,
-                    f"✅ You are now assigned to Ticket #{ticket.id}.",
-                    parse_mode="Markdown"
-                )
-                logger.info(f"Notified admin {admin_id} of assignment for ticket {ticket_id}")
-                # Update admin message
-                bot.edit_message_text(
-                    f"✅ Ticket #{ticket.id} assigned to you for handling.",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=None
-                )
-                bot.answer_callback_query(call.id, "✅ Ticket handled by you.")
-            except Exception as e:
-                logger.error(f"Failed to notify for handle of ticket {ticket_id}: {e}")
-                bot.answer_callback_query(call.id, f"✅ Ticket handled, but notification failed: {str(e)}", show_alert=True)
-        else:
+        if result["status"] != "success":
             bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
-            logger.error(f"Handle failed for ticket {ticket_id}: {result['message']}")
+            logger.error(f"Failed to handle ticket {ticket_id}: {result['message']}")
+            return
+
+        try:
+            ticket = Ticket.objects.get(id=ticket_id)
+            # Notify customer
+            bot.send_message(
+                ticket.customer.telegram_id,
+                f"📩 An admin is now handling your Ticket #{ticket.id}.",
+                parse_mode="Markdown"
+            )
+            logger.info(f"Notified customer {ticket.customer.telegram_id} of admin handling for ticket {ticket_id}")
+            # Notify admin
+            bot.send_message(
+                admin_id,
+                f"✅ You are now assigned to Ticket #{ticket.id}.",
+                parse_mode="Markdown"
+            )
+            logger.info(f"Notified admin {admin_id} of assignment for ticket {ticket_id}")
+            # Update admin message
+            bot.edit_message_text(
+                f"✅ Ticket #{ticket.id} assigned to you for handling.",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None
+            )
+            bot.answer_callback_query(call.id, "✅ Ticket handled by you.")
+        except Exception as e:
+            logger.error(f"Failed to notify for handle of ticket {ticket_id}: {e}")
+            bot.answer_callback_query(call.id, f"✅ Ticket handled, but notification failed: {str(e)}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("close_finally_"))
     def cb_close_ticket_finally(call: CallbackQuery):
         ticket_id = int(call.data.split("_")[2])
         admin_id = call.from_user.id
         result = close_ticket_finally(ticket_id, admin_id)
-        if result["status"] == "success":
-            try:
-                ticket = Ticket.objects.get(id=ticket_id)
-                agent_telegram_id = result.get("agent_telegram_id")
-                # Notify customer
+        if result["status"] != "success":
+            bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
+            logger.error(f"Failed to permanently close ticket {ticket_id}: {result['message']}")
+            return
+
+        try:
+            ticket = Ticket.objects.get(id=ticket_id)
+            agent_telegram_id = result.get("agent_telegram_id")
+            # Notify customer
+            bot.send_message(
+                ticket.customer.telegram_id,
+                f"🔒 Your Ticket #{ticket.id} has been permanently closed by an admin.\nSummary: {sanitize_text(ticket.resolution_summary or ticket.closure_summary or 'No summary provided')}",
+                parse_mode="Markdown"
+            )
+            logger.info(f"Notified customer {ticket.customer.telegram_id} of final closure for ticket {ticket_id}")
+            # Notify original agent if available
+            if agent_telegram_id:
                 bot.send_message(
-                    ticket.customer.telegram_id,
-                    f"🔒 Your Ticket #{ticket.id} has been permanently closed by an admin.\nSummary: {sanitize_text(ticket.closure_summary)}",
+                    agent_telegram_id,
+                    f"🔒 Ticket #{ticket.id} has been permanently closed by an admin.\nSummary: {sanitize_text(ticket.resolution_summary or ticket.closure_summary or 'No summary provided')}",
                     parse_mode="Markdown"
                 )
-                logger.info(f"Notified customer {ticket.customer.telegram_id} of final closure for ticket {ticket_id}")
-                # Notify original agent if available
-                if agent_telegram_id:
-                    bot.send_message(
-                        agent_telegram_id,
-                        f"🔒 Ticket #{ticket.id} has been permanently closed by an admin.\nSummary: {sanitize_text(ticket.closure_summary)}",
-                        parse_mode="Markdown"
-                    )
-                    logger.info(f"Notified agent {agent_telegram_id} of final closure for ticket {ticket_id}")
-                # Update admin message
-                bot.edit_message_text(
-                    f"🔒 Ticket #{ticket.id} permanently closed by admin.",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=None
-                )
-                bot.answer_callback_query(call.id, "✅ Ticket permanently closed.")
-            except Exception as e:
-                logger.error(f"Failed to notify for final closure of ticket {ticket_id}: {e}")
-                bot.answer_callback_query(call.id, f"✅ Ticket closed, but notification failed: {str(e)}", show_alert=True)
-        else:
-            bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
-            logger.error(f"Final closure failed for ticket {ticket_id}: {result['message']}")
+                logger.info(f"Notified agent {agent_telegram_id} of final closure for ticket {ticket_id}")
+            # Update admin message
+            bot.edit_message_text(
+                f"🔒 Ticket #{ticket.id} permanently closed by admin.",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None
+            )
+            bot.answer_callback_query(call.id, "✅ Ticket permanently closed.")
+        except Exception as e:
+            logger.error(f"Failed to notify for final closure of ticket {ticket_id}: {e}")
+            bot.answer_callback_query(call.id, f"✅ Ticket closed, but notification failed: {str(e)}", show_alert=True)
