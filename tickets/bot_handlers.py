@@ -1,6 +1,6 @@
 from telebot.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
 from django.conf import settings
-from agents.models import Agent
+from agents.models import Agent, AgentMessage
 from tickets.models import Ticket
 from customers.models import CustomerMessage
 from tickets.views import (
@@ -16,11 +16,13 @@ from tickets.views import (
     close_ticket_finally,
 )
 import logging
+import datetime
 
 logger = logging.getLogger(__name__)
 
 def sanitize_text(text):
-    return text.encode('utf-8', errors='ignore').decode('utf-8')
+    """Ensure UTF-8 safe text for Telegram."""
+    return text.encode('utf-8', errors='ignore').decode('utf-8') if text else ""
 
 def _agent_active_ticket(telegram_id: int):
     """Return the single active ticket assigned to this agent, if any."""
@@ -32,95 +34,6 @@ def _agent_active_ticket(telegram_id: int):
     ).order_by("-created_at").first()
 
 def register_ticket_handlers(bot):
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("claim_"))
-    def handle_claim_ticket(call: CallbackQuery):
-        ticket_id = int(call.data.split("_")[1])
-        user_id = call.from_user.id
-
-        result = claim_ticket(ticket_id, user_id)
-        if result["status"] != "success":
-            bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
-            return
-
-        ticket = result["ticket"]
-        agent = result["agent"]
-
-        try:
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        except Exception:
-            logger.warning(f"Failed to remove reply markup for ticket {ticket_id}")
-            pass
-        try:
-            bot.edit_message_text(
-                f"📩 Ticket #{ticket.id} claimed by Agent {agent.full_name} (ID:{agent.id:03d})\n\n{call.message.text}",
-                call.message.chat.id,
-                call.message.message_id
-            )
-        except Exception:
-            logger.warning(f"Failed to edit message for ticket {ticket_id}")
-            pass
-
-        bot.send_message(
-            agent.telegram_id,
-            f"✅ You’ve claimed Ticket #{ticket.id}.\n\nForwarding previous messages now..."
-        )
-
-        queued_messages = CustomerMessage.objects.filter(
-            customer=ticket.customer,
-            is_forwarded=False
-        ).order_by("sent_at")
-
-        if queued_messages.exists():
-            for msg in queued_messages:
-                label = f"📨 Message from {ticket.customer.full_name or ticket.customer.telegram_id}:"
-                content = sanitize_text(msg.message_text or "[Media Message]")
-                bot.send_message(agent.telegram_id, f"{label}\n\n{content}")
-                msg.is_forwarded = True
-                msg.save()
-        else:
-            bot.send_message(agent.telegram_id, "ℹ️ No previous messages were found.")
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("preview_"))
-    def handle_preview_messages(call: CallbackQuery):
-        ticket_id = int(call.data.split("_")[1])
-        user_id = call.from_user.id
-
-        try:
-            ticket = Ticket.objects.get(id=ticket_id)
-        except Ticket.DoesNotExist:
-            bot.answer_callback_query(call.id, "❌ Ticket not found.", show_alert=True)
-            logger.error(f"Ticket {ticket_id} not found for preview by user {user_id}")
-            return
-
-        if not Agent.objects.filter(telegram_id=user_id).exists():
-            bot.answer_callback_query(call.id, "🚫 This action is for registered agents only.", show_alert=True)
-            logger.warning(f"Non-agent {user_id} attempted to preview ticket {ticket_id}")
-            return
-
-        queued_messages = CustomerMessage.objects.filter(
-            customer=ticket.customer,
-            is_forwarded=False
-        ).order_by("sent_at")
-
-        if not queued_messages.exists():
-            bot.send_message(user_id, f"ℹ️ No queued messages for Ticket #{ticket.id}.")
-            logger.info(f"No queued messages found for ticket {ticket_id} preview by agent {user_id}")
-            return
-
-        preview_text = f"📬 Queued Messages for Ticket #{ticket.id}:\n\n"
-        for i, msg in enumerate(queued_messages, 1):
-            label = f"📨 Message {i} from {ticket.customer.full_name or ticket.customer.telegram_id}:"
-            content = sanitize_text(msg.message_text or "[Media Message]")
-            preview_text += f"{label}\n{content}\n\n"
-
-        try:
-            bot.send_message(user_id, preview_text, parse_mode="Markdown")
-            logger.info(f"Sent preview of {queued_messages.count()} messages for ticket {ticket_id} to agent {user_id}")
-            bot.answer_callback_query(call.id, "✅ Messages previewed. Check your private chat.")
-        except Exception as e:
-            logger.error(f"Failed to send preview for ticket {ticket_id} to agent {user_id}: {e}")
-            bot.answer_callback_query(call.id, f"❌ Failed to preview messages: {str(e)}", show_alert=True)
-
     @bot.message_handler(commands=['resolve_ticket'])
     def handle_resolve_ticket_cmd(message: Message):
         agent_tid = message.from_user.id
@@ -216,6 +129,141 @@ def register_ticket_handlers(bot):
                 logger.info(f"Sent closure approval request for ticket {ticket.id} to admin {admin_id}")
             except Exception as e:
                 logger.error(f"Failed to notify admin {admin_id} for ticket {ticket.id}: {e}")
+
+    @bot.message_handler(func=lambda message: Agent.objects.filter(telegram_id=message.from_user.id).exists())
+    def handle_agent_message(message: Message):
+        """Handle messages sent by agents and save them to AgentMessage."""
+        agent_tid = message.from_user.id
+        ticket = _agent_active_ticket(agent_tid)
+        
+        if not ticket:
+            bot.reply_to(message, "⚠️ You have no active ticket to respond to.")
+            return
+        
+        try:
+            agent = Agent.objects.get(telegram_id=agent_tid)
+            AgentMessage.objects.create(
+                ticket=ticket,
+                agent=agent,
+                customer=ticket.customer,
+                message_text=message.text or "[Media Message]",
+                message_type=message.content_type,
+                telegram_message_id=message.message_id,
+                sent_at=datetime.datetime.fromtimestamp(message.date)
+            )
+            logger.info(f"Agent message saved for ticket {ticket.id} from agent {agent_tid}: {message.text or '[Media Message]'}")
+            bot.send_message(
+                ticket.customer.telegram_id,
+                f"📬 Response from Agent {agent.full_name or agent.telegram_id}:\n\n{sanitize_text(message.text or '[Media Message]')}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to save or forward agent message for ticket {ticket.id}: {e}")
+            bot.reply_to(message, f"❌ Failed to send message: {str(e)}")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("claim_"))
+    def handle_claim_ticket(call: CallbackQuery):
+        ticket_id = int(call.data.split("_")[1])
+        user_id = call.from_user.id
+
+        result = claim_ticket(ticket_id, user_id)
+        if result["status"] != "success":
+            bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
+            return
+
+        ticket = result["ticket"]
+        agent = result["agent"]
+
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            logger.warning(f"Failed to remove reply markup for ticket {ticket_id}")
+            pass
+        try:
+            bot.edit_message_text(
+                f"📩 Ticket #{ticket.id} claimed by Agent {agent.full_name} (ID:{agent.id:03d})\n\n{call.message.text}",
+                call.message.chat.id,
+                call.message.message_id
+            )
+        except Exception:
+            logger.warning(f"Failed to edit message for ticket {ticket_id}")
+            pass
+
+        bot.send_message(
+            agent.telegram_id,
+            f"✅ You’ve claimed Ticket #{ticket.id}.\n\nForwarding conversation history now..."
+        )
+
+        # Fetch and combine CustomerMessage and AgentMessage for the ticket's customer
+        customer_messages = CustomerMessage.objects.filter(
+            customer=ticket.customer
+        ).order_by("sent_at")
+        agent_messages = AgentMessage.objects.filter(
+            ticket__customer=ticket.customer
+        ).order_by("sent_at")
+
+        # Combine messages and sort by sent_at
+        all_messages = [
+            (msg.sent_at, f"Customer {ticket.customer.full_name or ticket.customer.telegram_id}", msg.message_text)
+            for msg in customer_messages
+        ] + [
+            (msg.sent_at, f"Agent {msg.agent.full_name or msg.agent.telegram_id} (Ticket #{msg.ticket_id})", msg.message_text)
+            for msg in agent_messages
+        ]
+        all_messages.sort(key=lambda x: x[0])  # Sort by sent_at
+
+        if all_messages:
+            bot.send_message(agent.telegram_id, f"📜 Conversation history for Ticket #{ticket.id}:")
+            for sent_at, sender, content in all_messages:
+                label = f"📨 {sender}:"
+                content = sanitize_text(content or "[Media Message]")
+                bot.send_message(agent.telegram_id, f"{label}\n{content}\n\nSent at: {sent_at}")
+            logger.info(f"Forwarded {len(all_messages)} messages for ticket {ticket_id} to agent {agent.telegram_id}")
+            # Mark customer messages as forwarded
+            customer_messages.update(is_forwarded=True)
+        else:
+            bot.send_message(agent.telegram_id, "ℹ️ No previous messages were found.")
+            logger.info(f"No previous messages found for ticket {ticket_id} for agent {agent.telegram_id}")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("preview_"))
+    def handle_preview_messages(call: CallbackQuery):
+        ticket_id = int(call.data.split("_")[1])
+        user_id = call.from_user.id
+
+        try:
+            ticket = Ticket.objects.get(id=ticket_id)
+        except Ticket.DoesNotExist:
+            bot.answer_callback_query(call.id, "❌ Ticket not found.", show_alert=True)
+            logger.error(f"Ticket {ticket_id} not found for preview by user {user_id}")
+            return
+
+        if not Agent.objects.filter(telegram_id=user_id).exists():
+            bot.answer_callback_query(call.id, "🚫 This action is for registered agents only.", show_alert=True)
+            logger.warning(f"Non-agent {user_id} attempted to preview ticket {ticket_id}")
+            return
+
+        queued_messages = CustomerMessage.objects.filter(
+            customer=ticket.customer,
+            is_forwarded=False
+        ).order_by("sent_at")
+
+        if not queued_messages.exists():
+            bot.send_message(user_id, f"ℹ️ No queued messages for Ticket #{ticket.id}.")
+            logger.info(f"No queued messages found for ticket {ticket_id} preview by agent {user_id}")
+            return
+
+        preview_text = f"📬 Queued Messages for Ticket #{ticket.id}:\n\n"
+        for i, msg in enumerate(queued_messages, 1):
+            label = f"📨 Message {i} from {ticket.customer.full_name or ticket.customer.telegram_id}:"
+            content = sanitize_text(msg.message_text or "[Media Message]")
+            preview_text += f"{label}\n{content}\n\n"
+
+        try:
+            bot.send_message(user_id, preview_text, parse_mode="Markdown")
+            logger.info(f"Sent preview of {queued_messages.count()} messages for ticket {ticket_id} to agent {user_id}")
+            bot.answer_callback_query(call.id, "✅ Messages previewed. Check your private chat.")
+        except Exception as e:
+            logger.error(f"Failed to send preview for ticket {ticket_id} to agent {user_id}: {e}")
+            bot.answer_callback_query(call.id, f"❌ Failed to preview messages: {str(e)}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_resolved_"))
     def cb_approve_resolved(call: CallbackQuery):

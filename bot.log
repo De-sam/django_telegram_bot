@@ -1,20 +1,18 @@
-Sent preview of 3 messages for ticket 1 to agent 744260641
+Non-agent 744260641 attempted to preview ticket 1
+Sent preview of 1 messages for ticket 1 to agent 744260641
 Ticket 1 claimed by agent 744260641
-Forwarded 3 messages for ticket 1 to agent 744260641
-Saved and forwarded agent message for ticket 1 from agent 744260641
-Saved and forwarded agent message for ticket 1 from agent 744260641
-Saved and forwarded agent message for ticket 1 from agent 744260641
-Failed to save or forward agent message for ticket 1: A request to the Telegram API was unsuccessful. Error code: 400. Description: Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 40
-Failed to save or forward agent message for ticket 1: A request to the Telegram API was unsuccessful. Error code: 400. Description: Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 40
-Saved and forwarded agent message for ticket 1 from agent 744260641
-Saved and forwarded agent message for ticket 1 from agent 744260641
-Failed to save or forward agent message for ticket 1: NOT NULL constraint failed: agents_agentmessage.customer_id
-Failed to save or forward agent message for ticket 1: NOT NULL constraint failed: agents_agentmessage.customer_id
-Failed to save or forward agent message for ticket 1: NOT NULL constraint failed: agents_agentmessage.customer_id
+Forwarded 2 messages for ticket 1 to agent 744260641
+Agent message saved for ticket 1 from agent 744260641: Good afternoon what can we do for you
+Agent message saved for ticket 1 from agent 744260641: Okay for what product please?
+Agent message saved for ticket 1 from agent 744260641: Okay one moment
 Ticket 1 marked as closed by agent 744260641
 Sent closure approval request for ticket 1 to admin 744260641
 Closure approved for ticket 1 by admin 744260641, agent unlinked
 Notified customer 7957663994 of closure approval for ticket 1
 Notified agent 744260641 of closure approval and unlinking for ticket 1
-Ticket 1 permanently closed by admin 744260641
-Notified customer 7957663994 of final closure for ticket 1
+Ticket 1 raised back to support group
+Notified customer 7957663994 of ticket raise for 1
+Posted reopened ticket 1 to support group
+No queued messages found for ticket 1 preview by agent 744260641
+Ticket 1 claimed by agent 744260641
+Forwarded 7 messages for ticket 1 to agent 744260641
