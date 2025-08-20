@@ -508,10 +508,37 @@ def register_ticket_handlers(bot):
             # Notify admin
             bot.send_message(
                 admin_id,
-                f"✅ You are now assigned to Ticket #{ticket.id}.",
-                parse_mode="Markdown"
+                f"✅ You are now assigned to Ticket #{ticket.id}.\n\nForwarding conversation history now..."
             )
             logger.info(f"Notified admin {admin_id} of assignment for ticket {ticket_id}")
+            # Fetch and combine CustomerMessage and AgentMessage for the ticket's customer
+            customer_messages = CustomerMessage.objects.filter(
+                customer=ticket.customer
+            ).order_by("sent_at")
+            agent_messages = AgentMessage.objects.filter(
+                ticket__customer=ticket.customer
+            ).order_by("sent_at")
+            # Combine messages and sort by sent_at
+            all_messages = [
+                (msg.sent_at, f"Customer {ticket.customer.full_name or ticket.customer.telegram_id}", msg.message_text)
+                for msg in customer_messages
+            ] + [
+                (msg.sent_at, f"Agent {msg.agent.full_name or msg.agent.telegram_id} (Ticket #{msg.ticket_id})", msg.message_text)
+                for msg in agent_messages
+            ]
+            all_messages.sort(key=lambda x: x[0])  # Sort by sent_at
+            if all_messages:
+                bot.send_message(admin_id, f"📜 Conversation history for Ticket #{ticket.id}:")
+                for sent_at, sender, content in all_messages:
+                    label = f"📨 {sender}:"
+                    content = sanitize_text(content or "[Media Message]")
+                    bot.send_message(admin_id, f"{label}\n{content}\n\nSent at: {sent_at}")
+                logger.info(f"Forwarded {len(all_messages)} messages for ticket {ticket_id} to admin {admin_id}")
+                # Mark customer messages as forwarded
+                customer_messages.update(is_forwarded=True)
+            else:
+                bot.send_message(admin_id, "ℹ️ No previous messages were found.")
+                logger.info(f"No previous messages found for ticket {ticket_id} for admin {admin_id}")
             # Update admin message
             bot.edit_message_text(
                 f"✅ Ticket #{ticket.id} assigned to you for handling.",
@@ -521,8 +548,8 @@ def register_ticket_handlers(bot):
             )
             bot.answer_callback_query(call.id, "✅ Ticket handled by you.")
         except Exception as e:
-            logger.error(f"Failed to notify for handle of ticket {ticket_id}: {e}")
-            bot.answer_callback_query(call.id, f"✅ Ticket handled, but notification failed: {str(e)}", show_alert=True)
+            logger.error(f"Failed to notify or forward history for handle of ticket {ticket_id}: {e}")
+            bot.answer_callback_query(call.id, f"✅ Ticket handled, but notification or history forwarding failed: {str(e)}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("close_finally_"))
     def cb_close_ticket_finally(call: CallbackQuery):
