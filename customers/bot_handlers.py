@@ -48,15 +48,16 @@ def has_allowed_mime(mime_type: str) -> bool:
     })
     if not mime_type:
         return False
-    # Some clients send generic 'image/*'; we only allow explicit ones listed.
     return mime_type in allowed_mimes
 
 def is_allowed_document(document) -> bool:
     """Validate Telegram 'document' by filename extension or MIME."""
     name_ok = has_allowed_extension(getattr(document, 'file_name', '') or '')
     mime_ok = has_allowed_mime(getattr(document, 'mime_type', '') or '')
-    # Prefer extension check; fall back to MIME if needed
     return name_ok or mime_ok
+
+# In-memory state store for media caption handling
+_pending_media = {}
 
 # -------------------------------
 # Handlers
@@ -81,6 +82,125 @@ def register_customer_handlers(bot):
     def handle_text(message: Message):
         user_id = message.from_user.id
         text = (message.text or "").strip()
+
+        # Check if user is in caption input state
+        if user_id in _pending_media:
+            media_data = _pending_media[user_id]
+            caption = text or "[No caption provided]"
+            content_type = media_data['content_type']
+            customer = media_data['customer']
+            customer_message = media_data['customer_message']
+            ticket = media_data.get('ticket')
+
+            # Update the existing media message with the caption
+            try:
+                customer_message.message_text = caption
+                customer_message.save()
+                logger.info(f"Updated media message caption for customer {user_id}, message_id: {customer_message.id}")
+            except Exception as e:
+                logger.error(f"Failed to update media message with caption for customer {user_id}: {e}")
+                bot.send_message(message.chat.id, "⚠️ Failed to process your caption. Please try again.")
+                customer_message.delete()
+                del _pending_media[user_id]
+                return
+
+            # If claimed, forward directly to agent
+            if ticket and ticket.agent:
+                label = f"📨 Media from {customer.full_name or customer.telegram_id}"
+                final_caption = sanitize_text(f"{label}\n\n{caption}")
+                try:
+                    if content_type == 'photo':
+                        bot.send_photo(
+                            ticket.agent.telegram_id,
+                            media_data['file_id'],
+                            caption=final_caption
+                        )
+                        logger.info(f"Forwarded photo to agent {ticket.agent.telegram_id} for ticket {ticket.id}")
+                    elif content_type == 'document':
+                        bot.send_document(
+                            ticket.agent.telegram_id,
+                            media_data['file_id'],
+                            caption=final_caption
+                        )
+                        logger.info(f"Forwarded document to agent {ticket.agent.telegram_id} for ticket {ticket.id}")
+                    customer_message.is_forwarded = True
+                    customer_message.save()
+                    logger.info(f"Marked message {customer_message.id} as forwarded for customer {user_id}")
+                except Exception as e:
+                    logger.error(f"Failed to forward media to agent for customer {user_id}, ticket {ticket.id if ticket else 'None'}: {e}")
+                    bot.send_message(message.chat.id, "⚠️ Failed to forward your message. Please try again.")
+                    customer_message.delete()
+                    del _pending_media[user_id]
+                    return
+                bot.send_message(
+                    message.chat.id,
+                    "✅ Your file and caption have been sent to our support team.",
+                    parse_mode="Markdown"
+                )
+                del _pending_media[user_id]
+                return
+
+            # Unclaimed: follow 3-message queue logic
+            message_count = CustomerMessage.objects.filter(customer=customer).count()
+            label = f"📩 ID:customer {customer.id:03d}"
+            full_caption = sanitize_text(f"{label}\n\n{caption}")
+
+            if message_count == 1:
+                try:
+                    ticket = Ticket.objects.create(customer=customer)
+                    logger.info(f"Created new ticket {ticket.id} for customer {user_id}")
+                except Exception as e:
+                    logger.error(f"Failed to create ticket for customer {user_id}: {e}")
+                    bot.send_message(message.chat.id, "⚠️ Failed to create a ticket. Please try again.")
+                    customer_message.delete()
+                    del _pending_media[user_id]
+                    return
+
+                markup = InlineKeyboardMarkup()
+                markup.add(
+                    InlineKeyboardButton("🎫 Claim Ticket", callback_data=f"claim_{ticket.id}"),
+                    InlineKeyboardButton("👀 Preview Messages", callback_data=f"preview_{ticket.id}")
+                )
+
+                try:
+                    if content_type == 'photo':
+                        bot.send_photo(
+                            settings.SUPPORT_CHAT,
+                            media_data['file_id'],
+                            caption=full_caption,
+                            reply_markup=markup
+                        )
+                        logger.info(f"Forwarded photo to support group for ticket {ticket.id}")
+                    elif content_type == 'document':
+                        bot.send_document(
+                            settings.SUPPORT_CHAT,
+                            media_data['file_id'],
+                            caption=full_caption,
+                            reply_markup=markup
+                        )
+                        logger.info(f"Forwarded document to support group for ticket {ticket.id}")
+                    customer_message.is_forwarded = True
+                    customer_message.save()
+                    logger.info(f"Marked message {customer_message.id} as forwarded to support group for customer {user_id}")
+                except Exception as e:
+                    logger.error(f"Failed to forward media to support group for customer {user_id}, ticket {ticket.id}: {e}")
+                    bot.send_message(message.chat.id, "⚠️ Failed to forward your message. Please try again.")
+                    customer_message.delete()
+                    del _pending_media[user_id]
+                    return
+
+                bot.send_message(
+                    message.chat.id,
+                    "✅ Your file and caption have been received. You may send *two more messages* if needed.",
+                    parse_mode="Markdown"
+                )
+            elif message_count in [2, 3]:
+                bot.send_message(message.chat.id, f"📄 File and caption queued ({message_count}/3). Thank you.")
+            else:
+                bot.send_message(message.chat.id, "⚠️ You've reached the message limit. An agent will get back to you shortly.")
+                logger.warning(f"Customer {user_id} reached message limit with {message_count} messages")
+            del _pending_media[user_id]
+            return
 
         # Block agents/admins from opening tickets as customers
         is_agent = Agent.objects.filter(telegram_id=user_id).exists()
@@ -114,6 +234,7 @@ def register_customer_handlers(bot):
                 message_type=message.content_type,
                 telegram_message_id=message.message_id
             )
+            logger.info(f"Saved text message {customer_message.id} for customer {user_id}")
         except Exception as e:
             logger.error(f"Failed to save message for customer {user_id}: {e}")
             bot.reply_to(message, "⚠️ Failed to process your message. Please try again.")
@@ -183,6 +304,7 @@ def register_customer_handlers(bot):
                 message.chat.id,
                 "⚠️ You've reached the message limit. Please wait while an agent reviews your inquiry."
             )
+            logger.warning(f"Customer {user_id} reached message limit with {message_count} messages")
 
     @bot.message_handler(content_types=['photo', 'document', 'video'])
     def handle_media(message: Message):
@@ -214,85 +336,39 @@ def register_customer_handlers(bot):
                 bot.send_message(message.chat.id, accepted_types_message(), parse_mode="Markdown")
                 return
 
-        # Telegram 'photo' is JPEG (allowed). PNG usually arrives as 'document' and is validated above.
+        # Get/Create customer
         customer, _ = Customer.objects.get_or_create(telegram_id=user_id)
-        caption = message.caption or "[Media Message]"
 
-        # Save media message AFTER validation
+        # Store media info and create a preliminary message
+        file_id = message.photo[-1].file_id if message.content_type == 'photo' else message.document.file_id
+        message_count = CustomerMessage.objects.filter(customer=customer).count()
+        ticket = Ticket.objects.filter(customer=customer, is_claimed=True, is_closed=False).first()
+
+        # Save media message with a temporary caption
         try:
             customer_message = CustomerMessage.objects.create(
                 customer=customer,
-                message_text=caption,
+                message_text="[Pending caption]",
                 message_type=message.content_type,
                 telegram_message_id=message.message_id
             )
+            logger.info(f"Saved preliminary media message {customer_message.id} for customer {user_id}")
         except Exception as e:
             logger.error(f"Failed to save media message for customer {user_id}: {e}")
             bot.send_message(message.chat.id, "⚠️ Failed to process your message. Please try again.")
             return
 
-        # If claimed, forward directly to agent
-        ticket = Ticket.objects.filter(customer=customer, is_claimed=True, is_closed=False).first()
-        if ticket and ticket.agent:
-            label = f"📨 Media from {customer.full_name or customer.telegram_id}"
-            final_caption = sanitize_text(f"{label}\n\n{caption}")
+        _pending_media[user_id] = {
+            'content_type': message.content_type,
+            'file_id': file_id,
+            'customer': customer,
+            'message_count': message_count + 1,  # Include the media message in count
+            'ticket': ticket,
+            'customer_message': customer_message
+        }
 
-            try:
-                if message.content_type == 'photo':
-                    bot.send_photo(ticket.agent.telegram_id, message.photo[-1].file_id, caption=final_caption)
-                elif message.content_type == 'document':
-                    bot.send_document(ticket.agent.telegram_id, message.document.file_id, caption=final_caption)
-                customer_message.is_forwarded = True
-                customer_message.save()
-                logger.info(f"Forwarded media from customer {user_id} to agent {ticket.agent.telegram_id} for ticket {ticket.id}")
-            except Exception as e:
-                logger.error(f"Failed to forward media to agent for customer {user_id}: {e}")
-                bot.send_message(message.chat.id, "⚠️ Failed to forward your message. Please try again.")
-                customer_message.delete()
-                return
-            return
-
-        # Unclaimed: follow 3-message queue logic
-        message_count = CustomerMessage.objects.filter(customer=customer).count()
-        label = f"📩 ID:customer {customer.id:03d}"
-        full_caption = sanitize_text(f"{label}\n\n{caption}")
-
-        if message_count == 1:
-            try:
-                ticket = Ticket.objects.create(customer=customer)
-                logger.info(f"Created new ticket {ticket.id} for customer {user_id}")
-            except Exception as e:
-                logger.error(f"Failed to create ticket for customer {user_id}: {e}")
-                bot.send_message(message.chat.id, "⚠️ Failed to create a ticket. Please try again.")
-                customer_message.delete()
-                return
-
-            markup = InlineKeyboardMarkup()
-            markup.add(
-                InlineKeyboardButton("🎫 Claim Ticket", callback_data=f"claim_{ticket.id}"),
-                InlineKeyboardButton("👀 Preview Messages", callback_data=f"preview_{ticket.id}")
-            )
-
-            try:
-                if message.content_type == 'photo':
-                    bot.send_photo(settings.SUPPORT_CHAT, message.photo[-1].file_id, caption=full_caption, reply_markup=markup)
-                elif message.content_type == 'document':
-                    bot.send_document(settings.SUPPORT_CHAT, message.document.file_id, caption=full_caption, reply_markup=markup)
-                customer_message.is_forwarded = True
-                customer_message.save()
-                logger.info(f"Forwarded media from customer {user_id} to support group for ticket {ticket.id}")
-            except Exception as e:
-                logger.error(f"Failed to forward media to support group for customer {user_id}: {e}")
-                bot.send_message(message.chat.id, "⚠️ Failed to forward your message. Please try again.")
-                customer_message.delete()
-                return
-
-            bot.send_message(
-                message.chat.id,
-                "✅ Your file has been received. You may send *two more messages* if needed.",
-                parse_mode="Markdown"
-            )
-        elif message_count in [2, 3]:
-            bot.send_message(message.chat.id, f"📄 File queued ({message_count}/3). Thank you.")
-        else:
-            bot.send_message(message.chat.id, "⚠️ You've reached the message limit. An agent will get back to you shortly.")
+        bot.send_message(
+            message.chat.id,
+            "📷 Please provide a caption for your media file.",
+            parse_mode="Markdown"
+        )
