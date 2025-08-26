@@ -14,7 +14,7 @@ class Customer(models.Model):
     banned = models.BooleanField(default=False)
     open_ticket_spam = models.IntegerField(default=1)
     open_ticket_link = models.CharField(max_length=255, blank=True, null=True)
-    open_ticket_time = models.DateTimeField(default=get_default_open_ticket_time)  # Fixed: Use callable function
+    open_ticket_time = models.DateTimeField(default=get_default_open_ticket_time)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -22,6 +22,7 @@ class Customer(models.Model):
 
 class CustomerMessage(models.Model):
     customer = models.ForeignKey(Customer, on_delete=models.CASCADE, related_name='messages')
+    ticket = models.ForeignKey("tickets.Ticket", on_delete=models.SET_NULL, null=True, blank=True, related_name='messages')
     message_text = models.TextField()
     message_type = models.CharField(max_length=50, default='text')
     telegram_message_id = models.BigIntegerField(blank=True, null=True)
