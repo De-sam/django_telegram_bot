@@ -15,38 +15,24 @@ from tickets.views import (
     handle_ticket,
     close_ticket_finally,
 )
+from django.utils import timezone
+from utils import sanitize_text, get_agent_active_ticket
 import logging
 import datetime
 
 logger = logging.getLogger(__name__)
 
-def sanitize_text(text):
-    """Ensure UTF-8 safe text for Telegram."""
-    return text.encode('utf-8', errors='ignore').decode('utf-8') if text else ""
-
-def _agent_active_ticket(telegram_id: int):
-    """Return the single active ticket assigned to this agent, if any."""
-    return Ticket.objects.filter(
-        agent__telegram_id=telegram_id,
-        is_claimed=True,
-        is_resolved=False,
-        is_closed=False,
-    ).order_by("-created_at").first()
-
 def register_ticket_handlers(bot):
     @bot.message_handler(commands=['resolve_ticket'])
     def handle_resolve_ticket_cmd(message: Message):
         agent_tid = message.from_user.id
-
         if not Agent.objects.filter(telegram_id=agent_tid).exists():
             bot.reply_to(message, "🚫 This command is for registered agents only.")
             return
-
-        ticket = _agent_active_ticket(agent_tid)
+        ticket = get_agent_active_ticket(agent_tid)
         if not ticket:
             bot.reply_to(message, "⚠️ You have no active ticket to resolve.")
             return
-
         prompt = bot.send_message(message.chat.id, "📝 Please enter the resolution summary for this ticket:")
         bot.register_next_step_handler(prompt, _resolve_collect_summary, ticket_id=ticket.id, agent_tid=agent_tid)
 
@@ -55,16 +41,13 @@ def register_ticket_handlers(bot):
         if not summary:
             bot.reply_to(msg, "⚠️ Summary cannot be empty. Try the command again: /resolve_ticket")
             return
-
         result = resolve_ticket(ticket_id, agent_tid, summary)
         if result["status"] != "success":
             bot.reply_to(msg, f"❌ {result['message']}")
             logger.error(f"Failed to resolve ticket {ticket_id}: {result['message']}")
             return
-
         ticket = Ticket.objects.get(id=ticket_id)
         bot.send_message(agent_tid, f"✅ Ticket #{ticket.id} marked as *resolved* (pending admin approval).", parse_mode="Markdown")
-
         markup = InlineKeyboardMarkup()
         markup.add(
             InlineKeyboardButton("✅ Approve", callback_data=f"approve_resolved_{ticket.id}"),
@@ -86,16 +69,13 @@ def register_ticket_handlers(bot):
     @bot.message_handler(commands=['close_ticket'])
     def handle_close_ticket_cmd(message: Message):
         agent_tid = message.from_user.id
-
         if not Agent.objects.filter(telegram_id=agent_tid).exists():
             bot.reply_to(message, "🚫 This command is for registered agents only.")
             return
-
-        ticket = _agent_active_ticket(agent_tid)
+        ticket = get_agent_active_ticket(agent_tid)
         if not ticket:
             bot.reply_to(message, "⚠️ You have no active ticket to close.")
             return
-
         prompt = bot.send_message(message.chat.id, "📝 Please enter the closure summary for this ticket:")
         bot.register_next_step_handler(prompt, _close_collect_summary, ticket_id=ticket.id, agent_tid=agent_tid)
 
@@ -104,16 +84,13 @@ def register_ticket_handlers(bot):
         if not summary:
             bot.reply_to(msg, "⚠️ Summary cannot be empty. Try the command again: /close_ticket")
             return
-
         result = close_ticket(ticket_id, agent_tid, summary)
         if result["status"] != "success":
             bot.reply_to(msg, f"❌ {result['message']}")
             logger.error(f"Failed to close ticket {ticket_id}: {result['message']}")
             return
-
         ticket = Ticket.objects.get(id=ticket_id)
         bot.send_message(agent_tid, f"✅ Ticket #{ticket.id} marked as *closed* (pending admin approval).", parse_mode="Markdown")
-
         markup = InlineKeyboardMarkup()
         markup.add(
             InlineKeyboardButton("✅ Approve", callback_data=f"approve_closed_{ticket.id}"),
@@ -136,28 +113,49 @@ def register_ticket_handlers(bot):
     def handle_agent_message(message: Message):
         """Handle messages sent by agents and save them to AgentMessage."""
         agent_tid = message.from_user.id
-        ticket = _agent_active_ticket(agent_tid)
-        
+        ticket = get_agent_active_ticket(agent_tid)
         if not ticket:
             bot.reply_to(message, "⚠️ You have no active ticket to respond to.")
             return
-        
         try:
             agent = Agent.objects.get(telegram_id=agent_tid)
+            message_text = message.text or "[No text provided]"
+            sent_at = datetime.datetime.fromtimestamp(message.date, tz=datetime.timezone.utc)
             AgentMessage.objects.create(
                 ticket=ticket,
                 agent=agent,
                 customer=ticket.customer,
-                message_text=message.text or "[Media Message]",
+                message_text=message_text,
                 message_type=message.content_type,
                 telegram_message_id=message.message_id,
-                sent_at=datetime.datetime.fromtimestamp(message.date)
+                sent_at=sent_at
             )
-            logger.info(f"Agent message saved for ticket {ticket.id} from agent {agent_tid}: {message.text or '[Media Message]'}")
-            bot.send_message(
-                ticket.customer.telegram_id,
-                f"📬 Response from Agent {agent.full_name or agent.telegram_id}:\n\n{sanitize_text(message.text or '[Media Message]')}"
-            )
+            logger.info(f"Agent message saved for ticket {ticket.id} from agent {agent_tid}: {message_text}")
+            label = f"👨‍💼 Agent {agent.full_name or agent.telegram_id}"
+            if message.content_type == 'text':
+                bot.send_message(
+                    ticket.customer.telegram_id,
+                    f"{label}:\n\n{sanitize_text(message_text)}"
+                )
+            elif message.content_type == 'photo':
+                bot.send_photo(
+                    ticket.customer.telegram_id,
+                    message.photo[-1].file_id,
+                    caption=f"{label}:\n\n{sanitize_text(message.caption or '')}"
+                )
+            elif message.content_type == 'document':
+                bot.send_document(
+                    ticket.customer.telegram_id,
+                    message.document.file_id,
+                    caption=f"{label}:\n\n{sanitize_text(message.caption or '')}"
+                )
+            elif message.content_type == 'video':
+                bot.send_video(
+                    ticket.customer.telegram_id,
+                    message.video.file_id,
+                    caption=f"{label}:\n\n{sanitize_text(message.caption or '')}"
+                )
+            bot.reply_to(message, "✅ Message sent to customer.")
         except Exception as e:
             logger.error(f"Failed to save or forward agent message for ticket {ticket.id}: {e}")
             bot.reply_to(message, f"❌ Failed to send message: {str(e)}")
@@ -176,35 +174,54 @@ def register_ticket_handlers(bot):
         ticket = result["ticket"]
         agent = result["agent"]
 
+        # 1) Remove inline buttons first (works for both text and media)
         try:
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         except Exception:
             logger.warning(f"Failed to remove reply markup for ticket {ticket_id}")
-            pass
-        try:
-            bot.edit_message_text(
-                f"📩 Ticket #{ticket.id} claimed by Agent {agent.full_name or agent.telegram_id} (ID:{agent.id:03d})\n\n{call.message.text}",
-                call.message.chat.id,
-                call.message.message_id
-            )
-        except Exception:
-            logger.warning(f"Failed to edit message for ticket {ticket_id}")
-            pass
 
+        # 2) Edit banner depending on message type (caption vs text)
+        try:
+            claimed_line = f"📩 Ticket #{ticket.id} claimed by Agent {agent.full_name or agent.telegram_id} (ID:{agent.id:03d})"
+            content_type = getattr(call.message, "content_type", "")
+
+            if content_type in ("photo", "document", "video", "animation", "audio", "voice"):
+                # Media messages must use caption editing
+                original_caption = getattr(call.message, "caption", "") or ""
+                new_caption = sanitize_text(f"{claimed_line}\n\n{original_caption}".strip())
+                bot.edit_message_caption(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    caption=new_caption
+                )
+            else:
+                # Plain text message
+                original_text = call.message.text or ""
+                new_text = sanitize_text(f"{claimed_line}\n\n{original_text}".strip())
+                bot.edit_message_text(
+                    new_text,
+                    call.message.chat.id,
+                    call.message.message_id
+                )
+        except Exception as e:
+            logger.warning(f"Failed to edit message/caption for ticket {ticket_id}: {e}")
+
+        # 3) Notify agent that they claimed the ticket
         bot.send_message(
             agent.telegram_id,
             f"✅ You’ve claimed Ticket #{ticket.id}.\n\nForwarding conversation history now..."
         )
 
-        # Fetch and combine CustomerMessage and AgentMessage for the ticket's customer
+        # 4) Send conversation history to the claiming agent
         customer_messages = CustomerMessage.objects.filter(
             customer=ticket.customer
         ).order_by("sent_at")
+
         agent_messages = AgentMessage.objects.filter(
             ticket__customer=ticket.customer
         ).order_by("sent_at")
 
-        # Combine messages and sort by sent_at
+        # Combine and sort by timestamp
         all_messages = [
             (msg.sent_at, f"Customer {ticket.customer.full_name or ticket.customer.telegram_id}", msg.message_text)
             for msg in customer_messages
@@ -212,7 +229,7 @@ def register_ticket_handlers(bot):
             (msg.sent_at, f"Agent {msg.agent.full_name or msg.agent.telegram_id} (Ticket #{msg.ticket_id})", msg.message_text)
             for msg in agent_messages
         ]
-        all_messages.sort(key=lambda x: x[0])  # Sort by sent_at
+        all_messages.sort(key=lambda x: x[0])
 
         if all_messages:
             bot.send_message(agent.telegram_id, f"📜 Conversation history for Ticket #{ticket.id}:")
@@ -221,31 +238,31 @@ def register_ticket_handlers(bot):
                 content = sanitize_text(content or "[Media Message]")
                 bot.send_message(agent.telegram_id, f"{label}\n{content}\n\nSent at: {sent_at}")
             logger.info(f"Forwarded {len(all_messages)} messages for ticket {ticket_id} to agent {agent.telegram_id}")
-            # Mark customer messages as forwarded
+
+            # Mark customer messages as forwarded now that the agent has the history
             customer_messages.update(is_forwarded=True)
         else:
             bot.send_message(agent.telegram_id, "ℹ️ No previous messages were found.")
             logger.info(f"No previous messages found for ticket {ticket_id} for agent {agent.telegram_id}")
 
+
     @bot.callback_query_handler(func=lambda call: call.data.startswith("preview_"))
     def handle_preview_messages(call: CallbackQuery):
         ticket_id = int(call.data.split("_")[1])
         user_id = call.from_user.id
-
         try:
             ticket = Ticket.objects.get(id=ticket_id)
         except Ticket.DoesNotExist:
             bot.answer_callback_query(call.id, "❌ Ticket not found.", show_alert=True)
             logger.error(f"Ticket {ticket_id} not found for preview by user {user_id}")
             return
-
         if not Agent.objects.filter(telegram_id=user_id).exists():
             bot.answer_callback_query(call.id, "🚫 This action is for registered agents only.", show_alert=True)
             logger.warning(f"Non-agent {user_id} attempted to preview ticket {ticket_id}")
             return
-
         queued_messages = CustomerMessage.objects.filter(
             customer=ticket.customer,
+            ticket=ticket,              # ✅ scope to this ticket only
             is_forwarded=False
         ).order_by("sent_at")
 
@@ -253,13 +270,11 @@ def register_ticket_handlers(bot):
             bot.send_message(user_id, f"ℹ️ No queued messages for Ticket #{ticket.id}.")
             logger.info(f"No queued messages found for ticket {ticket_id} preview by agent {user_id}")
             return
-
         preview_text = f"📬 Queued Messages for Ticket #{ticket.id}:\n\n"
         for i, msg in enumerate(queued_messages, 1):
             label = f"📨 Message {i} from {ticket.customer.full_name or ticket.customer.telegram_id}:"
             content = sanitize_text(msg.message_text or "[Media Message]")
             preview_text += f"{label}\n{content}\n\n"
-
         try:
             bot.send_message(user_id, preview_text, parse_mode="Markdown")
             logger.info(f"Sent preview of {queued_messages.count()} messages for ticket {ticket_id} to agent {user_id}")
@@ -276,7 +291,6 @@ def register_ticket_handlers(bot):
             bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
             logger.error(f"Failed to approve resolution for ticket {ticket_id}: {result['message']}")
             return
-
         try:
             ticket = Ticket.objects.get(id=ticket_id)
             agent_telegram_id = result.get("agent_telegram_id")
@@ -300,19 +314,32 @@ def register_ticket_handlers(bot):
             else:
                 logger.warning(f"No agent Telegram ID available for resolution approval notification of ticket {ticket_id}")
             # Update admin message with action buttons
+            # new_markup = InlineKeyboardMarkup()
+            # new_markup.add(
+            #     InlineKeyboardButton("📬 Raise Ticket", callback_data=f"raise_ticket_{ticket.id}"),
+            #     InlineKeyboardButton("🤝 Handle Ticket", callback_data=f"handle_ticket_{ticket.id}"),
+            #     InlineKeyboardButton("🔒 Close Ticket Finally", callback_data=f"close_finally_{ticket.id}")
+            # )
+            # bot.edit_message_text(
+            #     f"✅ Ticket #{ticket.id} resolution approved by admin. Agent unlinked.\n\nChoose next action:",
+            #     call.message.chat.id,
+            #     call.message.message_id,
+            #     reply_markup=new_markup
+            # )
+            # bot.answer_callback_query(call.id, "✅ Resolution approved. Choose next action.")
+            # Update admin message — only offer Final Close (no Raise / Handle after resolution)
             new_markup = InlineKeyboardMarkup()
             new_markup.add(
-                InlineKeyboardButton("📬 Raise Ticket", callback_data=f"raise_ticket_{ticket.id}"),
-                InlineKeyboardButton("🤝 Handle Ticket", callback_data=f"handle_ticket_{ticket.id}"),
                 InlineKeyboardButton("🔒 Close Ticket Finally", callback_data=f"close_finally_{ticket.id}")
             )
             bot.edit_message_text(
-                f"✅ Ticket #{ticket.id} resolution approved by admin. Agent unlinked.\n\nChoose next action:",
+                f"✅ Ticket #{ticket.id} resolution approved by admin. Agent unlinked.\n\n"
+                f"You can permanently close this ticket if desired:",
                 call.message.chat.id,
                 call.message.message_id,
                 reply_markup=new_markup
             )
-            bot.answer_callback_query(call.id, "✅ Resolution approved. Choose next action.")
+            bot.answer_callback_query(call.id, "✅ Resolution approved.")
         except Exception as e:
             logger.error(f"Failed to notify or update for resolution approval of ticket {ticket_id}: {e}")
             bot.answer_callback_query(call.id, f"✅ Resolution approved, but notification failed: {str(e)}", show_alert=True)
@@ -325,7 +352,6 @@ def register_ticket_handlers(bot):
             bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
             logger.error(f"Failed to decline resolution for ticket {ticket_id}: {result['message']}")
             return
-
         try:
             ticket = Ticket.objects.get(id=ticket_id)
             agent_telegram_id = result.get("agent_telegram_id")
@@ -364,7 +390,6 @@ def register_ticket_handlers(bot):
             bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
             logger.error(f"Failed to approve closure for ticket {ticket_id}: {result['message']}")
             return
-
         try:
             ticket = Ticket.objects.get(id=ticket_id)
             agent_telegram_id = result.get("agent_telegram_id")
@@ -413,7 +438,6 @@ def register_ticket_handlers(bot):
             bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
             logger.error(f"Failed to decline closure for ticket {ticket_id}: {result['message']}")
             return
-
         try:
             ticket = Ticket.objects.get(id=ticket_id)
             agent_telegram_id = result.get("agent_telegram_id")
@@ -452,7 +476,6 @@ def register_ticket_handlers(bot):
             bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
             logger.error(f"Failed to raise ticket {ticket_id}: {result['message']}")
             return
-
         try:
             ticket = Ticket.objects.get(id=ticket_id)
             # Notify customer
@@ -495,7 +518,6 @@ def register_ticket_handlers(bot):
             bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
             logger.error(f"Failed to handle ticket {ticket_id}: {result['message']}")
             return
-
         try:
             ticket = Ticket.objects.get(id=ticket_id)
             # Notify customer
@@ -526,7 +548,7 @@ def register_ticket_handlers(bot):
                 (msg.sent_at, f"Agent {msg.agent.full_name or msg.agent.telegram_id} (Ticket #{msg.ticket_id})", msg.message_text)
                 for msg in agent_messages
             ]
-            all_messages.sort(key=lambda x: x[0])  # Sort by sent_at
+            all_messages.sort(key=lambda x: x[0]) # Sort by sent_at
             if all_messages:
                 bot.send_message(admin_id, f"📜 Conversation history for Ticket #{ticket.id}:")
                 for sent_at, sender, content in all_messages:
@@ -560,7 +582,6 @@ def register_ticket_handlers(bot):
             bot.answer_callback_query(call.id, f"❌ {result['message']}", show_alert=True)
             logger.error(f"Failed to permanently close ticket {ticket_id}: {result['message']}")
             return
-
         try:
             ticket = Ticket.objects.get(id=ticket_id)
             agent_telegram_id = result.get("agent_telegram_id")
