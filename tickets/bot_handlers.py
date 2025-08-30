@@ -131,7 +131,7 @@ def register_ticket_handlers(bot):
                 sent_at=sent_at
             )
             logger.info(f"Agent message saved for ticket {ticket.id} from agent {agent_tid}: {message_text}")
-            label = f"👨‍💼 Agent {agent.full_name or agent.telegram_id}"
+            label = f"👨‍💼 Agent {agent.full_name or agent.id:03d}"
             if message.content_type == 'text':
                 bot.send_message(
                     ticket.customer.telegram_id,
@@ -182,7 +182,7 @@ def register_ticket_handlers(bot):
 
         # 2) Edit banner depending on message type (caption vs text)
         try:
-            claimed_line = f"📩 Ticket #{ticket.id} claimed by Agent {agent.full_name or agent.telegram_id} (ID:{agent.id:03d})"
+            claimed_line = f"📩 Ticket #{ticket.id} claimed by Agent {agent.id:03d}"
             content_type = getattr(call.message, "content_type", "")
 
             if content_type in ("photo", "document", "video", "animation", "audio", "voice"):

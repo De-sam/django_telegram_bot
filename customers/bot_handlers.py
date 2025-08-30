@@ -109,7 +109,7 @@ def register_customer_handlers(bot):
 
             # If there's an active, claimed ticket with an agent → forward directly to agent
             if ticket and ticket.agent:
-                label = f"📨 Media from {customer.full_name or customer.telegram_id}"
+                label = f"📨 Media from {customer.full_name or customer.id:03d}"
                 final_caption = sanitize_text(f"{label}\n\n{caption}")
                 try:
                     if content_type == 'photo':
@@ -261,7 +261,7 @@ def register_customer_handlers(bot):
         # 4) If claimed ticket with agent → forward straight to agent
         # -----------------------------------------
         if ticket and ticket.is_claimed and ticket.agent:
-            label = f"📨 Customer {customer.full_name or customer.telegram_id}"
+            label = f"📨 Customer {customer.full_name or customer.id:03d}"
             msg = f"{label}:\n\n{text}"
             try:
                 bot.send_message(ticket.agent.telegram_id, sanitize_text(msg))
