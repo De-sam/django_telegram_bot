@@ -1,0 +1,5 @@
+/opt → optional application software (where custom apps live).
+
+/var/lib →
+
+sudo nano /etc/mybot.env

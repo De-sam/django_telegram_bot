@@ -62,6 +62,8 @@ ENV/
 env/
 env.bak/
 venv.bak/
+ref/
+db.sqlite3/
 
 # IDEs & editors
 .vscode/

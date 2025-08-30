@@ -131,7 +131,7 @@ def register_ticket_handlers(bot):
                 sent_at=sent_at
             )
             logger.info(f"Agent message saved for ticket {ticket.id} from agent {agent_tid}: {message_text}")
-            label = f"👨‍💼 Agent {agent.full_name or agent.id:03d}"
+            label = f"👨‍💼 Agent {int(agent.pk):03d}"
             if message.content_type == 'text':
                 bot.send_message(
                     ticket.customer.telegram_id,
@@ -182,7 +182,7 @@ def register_ticket_handlers(bot):
 
         # 2) Edit banner depending on message type (caption vs text)
         try:
-            claimed_line = f"📩 Ticket #{ticket.id} claimed by Agent {agent.id:03d}"
+            claimed_line = f"📩 Ticket #{ticket.id} claimed by Agent {int(agent.pk):03d}"
             content_type = getattr(call.message, "content_type", "")
 
             if content_type in ("photo", "document", "video", "animation", "audio", "voice"):
@@ -223,10 +223,10 @@ def register_ticket_handlers(bot):
 
         # Combine and sort by timestamp
         all_messages = [
-            (msg.sent_at, f"Customer {ticket.customer.full_name or ticket.customer.telegram_id}", msg.message_text)
+            (msg.sent_at, f"Customer {int(ticket.customer.pk):03d}", msg.message_text)
             for msg in customer_messages
         ] + [
-            (msg.sent_at, f"Agent {msg.agent.full_name or msg.agent.telegram_id} (Ticket #{msg.ticket_id})", msg.message_text)
+            (msg.sent_at, f"Agent {int(msg.agent.pk):03d} (Ticket #{msg.ticket_id})", msg.message_text)
             for msg in agent_messages
         ]
         all_messages.sort(key=lambda x: x[0])
@@ -272,7 +272,8 @@ def register_ticket_handlers(bot):
             return
         preview_text = f"📬 Queued Messages for Ticket #{ticket.id}:\n\n"
         for i, msg in enumerate(queued_messages, 1):
-            label = f"📨 Message {i} from {ticket.customer.full_name or ticket.customer.telegram_id}:"
+            cust_id = f"{int(ticket.customer.pk):03d}"
+            label = f"📨 Message {i} from Customer {cust_id}:"
             content = sanitize_text(msg.message_text or "[Media Message]")
             preview_text += f"{label}\n{content}\n\n"
         try:
@@ -542,10 +543,10 @@ def register_ticket_handlers(bot):
             ).order_by("sent_at")
             # Combine messages and sort by sent_at
             all_messages = [
-                (msg.sent_at, f"Customer {ticket.customer.full_name or ticket.customer.telegram_id}", msg.message_text)
+                (msg.sent_at, f"Customer {int(msg.customer.pk):03d}", msg.message_text)
                 for msg in customer_messages
             ] + [
-                (msg.sent_at, f"Agent {msg.agent.full_name or msg.agent.telegram_id} (Ticket #{msg.ticket_id})", msg.message_text)
+                (msg.sent_at, f"Agent {int(msg.agent.pk):03d} (Ticket #{msg.ticket_id})", msg.message_text)
                 for msg in agent_messages
             ]
             all_messages.sort(key=lambda x: x[0]) # Sort by sent_at
