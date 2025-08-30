@@ -22,6 +22,31 @@ import datetime
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------
+# Support posting helpers (multi‑group)
+# ---------------------------------
+
+def _support_chats():
+    """Return list of support chat IDs, from SUPPORT_CHATS or SUPPORT_CHAT."""
+    chats = getattr(settings, "SUPPORT_CHATS", None)
+    if chats:
+        return chats
+    single = getattr(settings, "SUPPORT_CHAT", None)
+    return [single] if single is not None else []
+
+
+def post_to_support(bot, *, text=None, reply_markup=None):
+    for chat_id in _support_chats():
+        try:
+            bot.send_message(chat_id, text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.error(f"Failed to post to support chat {chat_id}: {e}")
+
+
+# ---------------------------------
+# Handlers
+# ---------------------------------
+
 def register_ticket_handlers(bot):
     @bot.message_handler(commands=['resolve_ticket'])
     def handle_resolve_ticket_cmd(message: Message):
@@ -245,7 +270,6 @@ def register_ticket_handlers(bot):
             bot.send_message(agent.telegram_id, "ℹ️ No previous messages were found.")
             logger.info(f"No previous messages found for ticket {ticket_id} for agent {agent.telegram_id}")
 
-
     @bot.callback_query_handler(func=lambda call: call.data.startswith("preview_"))
     def handle_preview_messages(call: CallbackQuery):
         ticket_id = int(call.data.split("_")[1])
@@ -314,20 +338,6 @@ def register_ticket_handlers(bot):
                 logger.info(f"Notified agent {agent_telegram_id} of resolution approval and unlinking for ticket {ticket_id}")
             else:
                 logger.warning(f"No agent Telegram ID available for resolution approval notification of ticket {ticket_id}")
-            # Update admin message with action buttons
-            # new_markup = InlineKeyboardMarkup()
-            # new_markup.add(
-            #     InlineKeyboardButton("📬 Raise Ticket", callback_data=f"raise_ticket_{ticket.id}"),
-            #     InlineKeyboardButton("🤝 Handle Ticket", callback_data=f"handle_ticket_{ticket.id}"),
-            #     InlineKeyboardButton("🔒 Close Ticket Finally", callback_data=f"close_finally_{ticket.id}")
-            # )
-            # bot.edit_message_text(
-            #     f"✅ Ticket #{ticket.id} resolution approved by admin. Agent unlinked.\n\nChoose next action:",
-            #     call.message.chat.id,
-            #     call.message.message_id,
-            #     reply_markup=new_markup
-            # )
-            # bot.answer_callback_query(call.id, "✅ Resolution approved. Choose next action.")
             # Update admin message — only offer Final Close (no Raise / Handle after resolution)
             new_markup = InlineKeyboardMarkup()
             new_markup.add(
@@ -466,7 +476,7 @@ def register_ticket_handlers(bot):
             )
             bot.answer_callback_query(call.id, "✅ Closure declined.")
         except Exception as e:
-            logger.error(f"Failed to notify for closure decline of ticket {ticket_id}: {e}")
+            logger.error(f"Failed to notify for resolution decline of ticket {ticket_id}: {e}")
             bot.answer_callback_query(call.id, f"✅ Closure declined, but notification failed: {str(e)}", show_alert=True)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("raise_ticket_"))
@@ -486,18 +496,21 @@ def register_ticket_handlers(bot):
                 parse_mode="Markdown"
             )
             logger.info(f"Notified customer {ticket.customer.telegram_id} of ticket raise for {ticket_id}")
-            # Post to support group
+            # Post to support group(s)
             markup = InlineKeyboardMarkup()
             markup.add(
                 InlineKeyboardButton("🎫 Claim Ticket", callback_data=f"claim_{ticket.id}"),
                 InlineKeyboardButton("👀 Preview Messages", callback_data=f"preview_{ticket.id}")
             )
-            bot.send_message(
-                settings.SUPPORT_CHAT,
-                f"📩 Ticket #{ticket.id} reopened for re-claim.\n\nSummary: {sanitize_text(ticket.resolution_summary or ticket.closure_summary or 'No summary provided')}",
-                reply_markup=markup
+            post_to_support(
+                bot,
+                text=(
+                    f"📩 Ticket #{ticket.id} reopened for re-claim.\n\n"
+                    f"Summary: {sanitize_text(ticket.resolution_summary or ticket.closure_summary or 'No summary provided')}"
+                ),
+                reply_markup=markup,
             )
-            logger.info(f"Posted reopened ticket {ticket_id} to support group {settings.SUPPORT_CHAT}")
+            logger.info(f"Posted reopened ticket {ticket_id} to support groups {getattr(settings, 'SUPPORT_CHATS', []) or getattr(settings, 'SUPPORT_CHAT', None)}")
             # Update admin message
             bot.edit_message_text(
                 f"✅ Ticket #{ticket.id} raised back to support group.",
@@ -549,7 +562,7 @@ def register_ticket_handlers(bot):
                 (msg.sent_at, f"Agent {int(msg.agent.pk):03d} (Ticket #{msg.ticket_id})", msg.message_text)
                 for msg in agent_messages
             ]
-            all_messages.sort(key=lambda x: x[0]) # Sort by sent_at
+            all_messages.sort(key=lambda x: x[0])  # Sort by sent_at
             if all_messages:
                 bot.send_message(admin_id, f"📜 Conversation history for Ticket #{ticket.id}:")
                 for sent_at, sender, content in all_messages:

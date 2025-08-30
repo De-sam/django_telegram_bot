@@ -5,7 +5,6 @@ from telebot.types import (
 from utils import sanitize_text, get_active_ticket_for_customer
 from tickets.models import Ticket
 from customers.models import Customer, CustomerMessage
-from tickets.models import Ticket
 from agents.models import Agent
 import re
 import os
@@ -13,12 +12,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# -------------------------------
-# Helpers
-# -------------------------------
-def sanitize_text(text: str) -> str:
-    """Ensure UTF-8 safe text for Telegram."""
-    return text.encode('utf-8', errors='ignore').decode('utf-8')
+# ---------------------------------
+# File type validation helpers
+# ---------------------------------
 
 def accepted_types_message() -> str:
     """User-facing message for invalid file types based on settings."""
@@ -32,6 +28,7 @@ def accepted_types_message() -> str:
         "Tip: If you’re sending a PNG photo, send it as a file/document so the bot can detect the .png extension."
     )
 
+
 def has_allowed_extension(filename: str) -> bool:
     """Validate by extension using settings.ALLOWED_EXTENSIONS."""
     allowed_exts = getattr(settings, 'ALLOWED_EXTENSIONS', {'.pdf', '.docx', '.jpg', '.jpeg', '.png'})
@@ -39,6 +36,7 @@ def has_allowed_extension(filename: str) -> bool:
         return False
     _, ext = os.path.splitext(filename)
     return ext.lower() in allowed_exts
+
 
 def has_allowed_mime(mime_type: str) -> bool:
     """Validate by MIME using settings.ALLOWED_MIME_PREFIXES."""
@@ -52,18 +50,51 @@ def has_allowed_mime(mime_type: str) -> bool:
         return False
     return mime_type in allowed_mimes
 
+
 def is_allowed_document(document) -> bool:
     """Validate Telegram 'document' by filename extension or MIME."""
     name_ok = has_allowed_extension(getattr(document, 'file_name', '') or '')
     mime_ok = has_allowed_mime(getattr(document, 'mime_type', '') or '')
     return name_ok or mime_ok
 
+
 # In-memory state store for media caption handling
 _pending_media = {}
 
-# -------------------------------
+
+# ---------------------------------
+# Support posting helpers (multi‑group)
+# ---------------------------------
+
+def _support_chats():
+    """Return list of support chat IDs, from SUPPORT_CHATS or SUPPORT_CHAT."""
+    chats = getattr(settings, "SUPPORT_CHATS", None)
+    if chats:
+        return chats
+    single = getattr(settings, "SUPPORT_CHAT", None)
+    return [single] if single is not None else []
+
+
+def post_to_support(bot, *, text=None, caption=None, file_id=None, kind="text", reply_markup=None):
+    """Send text/photo/document to all configured support chats."""
+    for chat_id in _support_chats():
+        try:
+            if kind == "text":
+                bot.send_message(chat_id, text, reply_markup=reply_markup)
+            elif kind == "photo":
+                bot.send_photo(chat_id, file_id, caption=caption, reply_markup=reply_markup)
+            elif kind == "document":
+                bot.send_document(chat_id, file_id, caption=caption, reply_markup=reply_markup)
+            else:
+                logger.error(f"Unsupported kind '{kind}' for support post")
+        except Exception as e:
+            logger.error(f"Failed to post to support chat {chat_id}: {e}")
+
+
+# ---------------------------------
 # Handlers
-# -------------------------------
+# ---------------------------------
+
 def register_customer_handlers(bot):
     @bot.message_handler(commands=['start'])
     def handle_start(message: Message):
@@ -84,9 +115,7 @@ def register_customer_handlers(bot):
         user_id = message.from_user.id
         text = (message.text or "").strip()
 
-        # -----------------------------------------
         # 0) If user is providing a caption for a media message
-        # -----------------------------------------
         if user_id in _pending_media:
             media_data = _pending_media[user_id]
             caption = text or "[No caption provided]"
@@ -109,7 +138,7 @@ def register_customer_handlers(bot):
 
             # If there's an active, claimed ticket with an agent → forward directly to agent
             if ticket and ticket.agent:
-                label = f"📨 Media from {customer.full_name or customer.id:03d}"
+                label = f"📨 Media from {int(customer.pk):03d}"
                 final_caption = sanitize_text(f"{label}\n\n{caption}")
                 try:
                     if content_type == 'photo':
@@ -131,7 +160,6 @@ def register_customer_handlers(bot):
                 return
 
             # Per-ticket queue logic for UNCLAIMED flow
-            # If no active ticket (approved/closed previously), create a fresh ticket
             if not ticket:
                 try:
                     ticket = Ticket.objects.create(customer=customer)
@@ -147,9 +175,9 @@ def register_customer_handlers(bot):
 
                 # Count unforwarded messages for THIS ticket
                 count = CustomerMessage.objects.filter(
-                customer=customer, ticket=ticket, is_forwarded=False
+                    customer=customer, ticket=ticket, is_forwarded=False
                 ).count()  # should be 1
-                label = f"📩 Customer ID:{customer.id:03d}"
+                label = f"📩 Customer ID:{int(customer.pk):03d}"
                 full_caption = sanitize_text(f"{label}\n\n{caption}")
 
                 markup = InlineKeyboardMarkup()
@@ -158,15 +186,19 @@ def register_customer_handlers(bot):
                     InlineKeyboardButton("👀 Preview Messages", callback_data=f"preview_{ticket.id}")
                 )
                 try:
-                    if content_type == 'photo':
-                        bot.send_photo(settings.SUPPORT_CHAT, media_data['file_id'], caption=full_caption, reply_markup=markup)
-                    elif content_type == 'document':
-                        bot.send_document(settings.SUPPORT_CHAT, media_data['file_id'], caption=full_caption, reply_markup=markup)
+                    kind = 'photo' if content_type == 'photo' else 'document'
+                    post_to_support(
+                        bot,
+                        file_id=media_data['file_id'],
+                        caption=full_caption,
+                        kind=kind,
+                        reply_markup=markup,
+                    )
                     customer_message.is_forwarded = True
                     customer_message.save()
-                    logger.info(f"Forwarded media to group for ticket {ticket.id}")
+                    logger.info(f"Forwarded media to support for ticket {ticket.id}")
                 except Exception as e:
-                    logger.error(f"Forward media to group failed (cust {user_id}, ticket {ticket.id}): {e}")
+                    logger.error(f"Forward media to support failed (cust {user_id}, ticket {ticket.id}): {e}")
                     bot.send_message(message.chat.id, "⚠️ Failed to forward your message. Please try again.")
                     customer_message.delete()
                     del _pending_media[user_id]
@@ -178,7 +210,7 @@ def register_customer_handlers(bot):
 
             # Ticket exists but is UNCLAIMED → per-ticket counting
             count = CustomerMessage.objects.filter(
-            customer=customer, ticket=ticket, is_forwarded=False
+                customer=customer, ticket=ticket, is_forwarded=False
             ).count()
 
             label = f"📩 Customer ID:{int(customer.pk):03d}"
@@ -191,15 +223,19 @@ def register_customer_handlers(bot):
                     InlineKeyboardButton("👀 Preview Messages", callback_data=f"preview_{ticket.id}")
                 )
                 try:
-                    if content_type == 'photo':
-                        bot.send_photo(settings.SUPPORT_CHAT, media_data['file_id'], caption=full_caption, reply_markup=markup)
-                    elif content_type == 'document':
-                        bot.send_document(settings.SUPPORT_CHAT, media_data['file_id'], caption=full_caption, reply_markup=markup)
+                    kind = 'photo' if content_type == 'photo' else 'document'
+                    post_to_support(
+                        bot,
+                        file_id=media_data['file_id'],
+                        caption=full_caption,
+                        kind=kind,
+                        reply_markup=markup,
+                    )
                     customer_message.is_forwarded = True
                     customer_message.save()
-                    logger.info(f"Forwarded media to group (ticket {ticket.id})")
+                    logger.info(f"Forwarded media to support (ticket {ticket.id})")
                 except Exception as e:
-                    logger.error(f"Forward media to group failed (cust {user_id}, ticket {ticket.id}): {e}")
+                    logger.error(f"Forward media to support failed (cust {user_id}, ticket {ticket.id}): {e}")
                     bot.send_message(message.chat.id, "⚠️ Failed to forward your message. Please try again.")
                     customer_message.delete()
                     del _pending_media[user_id]
@@ -215,9 +251,7 @@ def register_customer_handlers(bot):
             del _pending_media[user_id]
             return
 
-        # -----------------------------------------
         # 1) Block agents/admins from opening tickets as customers
-        # -----------------------------------------
         is_agent = Agent.objects.filter(telegram_id=user_id).exists()
         is_admin = user_id in getattr(settings, 'ADMIN_IDS', [])
         if is_agent or is_admin:
@@ -232,18 +266,14 @@ def register_customer_handlers(bot):
             )
             return
 
-        # -----------------------------------------
         # 2) Language / bad-words filter (safe guard)
-        # -----------------------------------------
         if getattr(settings, 'BAD_WORDS_TOGGLE', False):
             pattern = getattr(settings, 'REGEX_FILTER', {}).get('bad_words')
             if pattern and re.match(pattern, text or "", re.IGNORECASE):
                 bot.reply_to(message, "⚠️ Please mind your language.")
                 return
 
-        # -----------------------------------------
         # 3) Get/Create customer + find active ticket (not finally approved)
-        # -----------------------------------------
         customer, _ = Customer.objects.get_or_create(telegram_id=user_id)
         ticket = get_active_ticket_for_customer(customer)  # may be None
 
@@ -262,11 +292,9 @@ def register_customer_handlers(bot):
             bot.reply_to(message, "⚠️ Failed to process your message. Please try again.")
             return
 
-        # -----------------------------------------
         # 4) If claimed ticket with agent → forward straight to agent
-        # -----------------------------------------
         if ticket and ticket.is_claimed and ticket.agent:
-            label = f"📨 Customer {customer.full_name or f'{int(customer.pk):03d}'}"
+            label = f"📨 Customer {int(customer.pk):03d}"
             msg = f"{label}:\n\n{text}"
 
             try:
@@ -280,9 +308,7 @@ def register_customer_handlers(bot):
                 customer_message.delete()
             return
 
-        # -----------------------------------------
         # 5) Unclaimed flow (queue) — create a new ticket if none exists yet
-        # -----------------------------------------
         if ticket is None:
             try:
                 ticket = Ticket.objects.create(customer=customer)
@@ -303,14 +329,14 @@ def register_customer_handlers(bot):
                 InlineKeyboardButton("🎫 Claim Ticket", callback_data=f"claim_{ticket.id}"),
                 InlineKeyboardButton("👀 Preview Messages", callback_data=f"preview_{ticket.id}")
             )
-            forwarded_text = f"📩 Customer ID:{customer.id:03d}\n\n{text}"
+            forwarded_text = f"📩 Customer ID:{int(customer.pk):03d}\n\n{text}"
             try:
-                bot.send_message(settings.SUPPORT_CHAT, sanitize_text(forwarded_text), reply_markup=markup)
+                post_to_support(bot, text=sanitize_text(forwarded_text), kind="text", reply_markup=markup)
                 customer_message.is_forwarded = True
                 customer_message.save()
-                logger.info(f"Forwarded first message to group for ticket {ticket.id}")
+                logger.info(f"Forwarded first message to support for ticket {ticket.id}")
             except Exception as e:
-                logger.error(f"Forward to group failed (cust {user_id}, ticket {ticket.id}): {e}")
+                logger.error(f"Forward to support failed (cust {user_id}, ticket {ticket.id}): {e}")
                 bot.reply_to(message, "⚠️ Failed to forward your message. Please try again.")
                 customer_message.delete()
                 return
@@ -322,9 +348,7 @@ def register_customer_handlers(bot):
             )
             return
 
-        # -----------------------------------------
         # 6) Ticket exists but unclaimed → per-ticket count & queue
-        # -----------------------------------------
         count_unf = CustomerMessage.objects.filter(
             customer=customer,
             ticket=ticket,
@@ -344,13 +368,12 @@ def register_customer_handlers(bot):
             )
             logger.warning(f"Customer {user_id} reached per-ticket message limit (ticket {ticket.id})")
 
-    
     @bot.message_handler(content_types=['photo', 'document', 'video'])
     def handle_media(message: Message):
         user_id = message.from_user.id
         # Block agents/admins
         is_agent = Agent.objects.filter(telegram_id=user_id).exists()
-        is_admin = user_id in settings.ADMIN_IDS
+        is_admin = user_id in getattr(settings, 'ADMIN_IDS', [])
         if is_agent or is_admin:
             role = "Admin" if is_admin else "Agent"
             if is_agent and is_admin:
@@ -371,30 +394,31 @@ def register_customer_handlers(bot):
             if not is_allowed_document(message.document):
                 bot.send_message(message.chat.id, accepted_types_message(), parse_mode="Markdown")
                 return
-        # Get/Create customer
-        # Get/Create customer
+
+        # Get/Create customer and active ticket
         customer, _ = Customer.objects.get_or_create(telegram_id=user_id)
-        # Use the same active-ticket logic as text handler (claimed OR unclaimed but not approved/closed)
         ticket = get_active_ticket_for_customer(customer)
 
         # Store media info and create a preliminary message
-        file_id = message.photo[-1].file_id if message.content_type == 'photo' else message.document.file_id
+        if message.content_type == 'photo':
+            file_id = message.photo[-1].file_id
+        else:
+            file_id = message.document.file_id
 
-        # Save media message with a temporary caption
         try:
             customer_message = CustomerMessage.objects.create(
-                    customer=customer,
-                    ticket=ticket,  # attach if there’s already an active ticket
-                    message_text="[Pending caption]",
-                    message_type=message.content_type,
-                    telegram_message_id=message.message_id
-                )
-
+                customer=customer,
+                ticket=ticket,  # attach if there’s already an active ticket
+                message_text="[Pending caption]",
+                message_type=message.content_type,
+                telegram_message_id=message.message_id
+            )
             logger.info(f"Saved preliminary media message {customer_message.id} for customer {user_id}")
         except Exception as e:
             logger.error(f"Failed to save media message for customer {user_id}: {e}")
             bot.send_message(message.chat.id, "⚠️ Failed to process your message. Please try again.")
             return
+
         _pending_media[user_id] = {
             'content_type': message.content_type,
             'file_id': file_id,
