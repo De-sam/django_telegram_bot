@@ -119,10 +119,7 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # ========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# New
-SUPPORT_CHATS = [
-    int(x.strip()) for x in os.getenv("SUPPORT_CHATS", "").split(",") if x.strip()
-]
+SUPPORT_CHAT = int(os.getenv("SUPPORT_CHAT", "0"))
 
 ADMIN_IDS = [
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
